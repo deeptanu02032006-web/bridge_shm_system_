@@ -58,7 +58,7 @@ load_env_file()
 
 MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "shm_bridge_db").strip()
-PORT = int(os.getenv("PORT", os.getenv("QUERY_API_PORT", "5000")))
+PORT = int(os.getenv("PORT") or os.getenv("QUERY_API_PORT") or "5000")
 API_KEY = os.getenv("QUERY_API_KEY", "SHM_SECURE_READ_KEY_2026").strip()
 BIND_HOST = os.getenv("QUERY_API_HOST", "0.0.0.0").strip()
 

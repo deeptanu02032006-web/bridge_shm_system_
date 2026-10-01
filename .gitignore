@@ -1,0 +1,21 @@
+# Environment & Credentials
+.env
+*.env
+.venv/
+venv/
+# Local Disk Queue Backup & Temp files
+*.tmp
+pending_queue.json
+*.log
+# Python cache & build outputs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

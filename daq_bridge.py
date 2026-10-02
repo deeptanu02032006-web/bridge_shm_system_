@@ -436,32 +436,14 @@ class MongoDBManager:
             print(f"[MONGODB] Ingestion error: {e}")
             return False, 0, 0
 
-    def check_old_session_backlog(self, current_session_id: str) -> bool:
-        """Checks if unsynced records exist for older telemetry sessions."""
-        if not self.is_connected and not self.connect():
-            return False
-        try:
-            telemetry_col = self.db["telemetry"]
-            count = telemetry_col.count_documents({
-                "arduino_id": ARDUINO_ID,
-                "session_id": {"$ne": current_session_id},
-                "$or": [
-                    {"synced_to_sheets": False},
-                    {"synced_to_sheets": {"$exists": False}}
-                ]
-            })
-            return count > 0
-        except Exception:
-            return False
-
-    def fetch_current_session_sync_batch(self, session_id: str, target_batch_size: int = MAX_SYNC_PACKETS_PER_BATCH, batch_window_sec: float = 120.0) -> tuple:
+    def fetch_unsynced_sync_batch(self, target_batch_size: int = MAX_SYNC_PACKETS_PER_BATCH, batch_window_sec: float = 120.0) -> tuple:
         """
-        Queries MongoDB telemetry collection for unsynced records belonging ONLY to session_id,
-        sorted by sequence ASCENDING.
+        Queries MongoDB telemetry collection for unsynced records (synced_to_sheets = False),
+        ordered chronologically by ingested_at ASCENDING.
 
         Determines batch readiness based on:
         1. 120 seconds of wall-clock time elapsed since the earliest unsynced record in the batch, OR
-        2. Accumulated target_batch_size (e.g. 120) records in current session.
+        2. Accumulated target_batch_size (e.g. 120) unsynced records.
 
         Returns tuple: (ready: bool, unsynced_packets: list, doc_ids: list, total_unsynced_count: int, elapsed_sec: float, reason: str)
         """
@@ -473,24 +455,21 @@ class MongoDBManager:
 
             query = {
                 "arduino_id": ARDUINO_ID,
-                "session_id": session_id,
                 "$or": [
                     {"synced_to_sheets": False},
                     {"synced_to_sheets": {"$exists": False}}
                 ]
             }
 
-            cursor = telemetry_col.find(query).sort("sequence", ASCENDING)
+            cursor = telemetry_col.find(query).sort("ingested_at", ASCENDING)
             unsynced_docs = list(cursor)
             total_unsynced = len(unsynced_docs)
 
             if total_unsynced == 0:
-                return False, [], [], 0, 0.0, "No unsynced records for active session"
+                return False, [], [], 0, 0.0, "No unsynced records"
 
             first_doc = unsynced_docs[0]
-            first_seq = first_doc.get("sequence", 1)
 
-            # Determine start timestamp of the batch
             first_ts_dt = first_doc.get("timestamp")
             if isinstance(first_ts_dt, datetime):
                 if first_ts_dt.tzinfo is None:
@@ -509,9 +488,6 @@ class MongoDBManager:
             now_dt = datetime.now(timezone.utc)
             elapsed_sec = max(0.0, (now_dt - first_ts_dt).total_seconds())
 
-            # Batch readiness conditions:
-            # 1) At least batch_window_sec (120s) elapsed since earliest unsynced record in batch.
-            # 2) Or accumulated target_batch_size (120) or more unsynced records.
             is_ready = False
             if elapsed_sec >= batch_window_sec:
                 is_ready = True
@@ -521,7 +497,6 @@ class MongoDBManager:
             if not is_ready:
                 return False, [], [], total_unsynced, elapsed_sec, f"Batch accumulating: {total_unsynced} records ({int(elapsed_sec)}s/{int(batch_window_sec)}s elapsed)"
 
-            # Take the records for this 120s batch (up to target_batch_size or all collected in window)
             batch_docs = unsynced_docs[:target_batch_size]
 
             unsynced_packets = []
@@ -543,7 +518,7 @@ class MongoDBManager:
 
                 packet = {
                     "arduino_id": doc.get("arduino_id", ARDUINO_ID),
-                    "session_id": doc.get("session_id", session_id),
+                    "session_id": doc.get("session_id", current_session_id),
                     "sequence": seq,
                     "timestamp": ts_str,
                     "sensors": doc.get("sensors", {})
@@ -554,12 +529,12 @@ class MongoDBManager:
             return True, unsynced_packets, doc_ids, total_unsynced, elapsed_sec, "Batch ready"
 
         except Exception as e:
-            print(f"[MONGODB SYNC] Error fetching current session sync batch from MongoDB: {e}")
+            print(f"[MONGODB SYNC] Error fetching unsynced batch from MongoDB: {e}")
             return False, [], [], 0, 0.0, str(e)
 
     def fetch_unsynced_telemetry_packets(self, max_packets: int = MAX_SYNC_PACKETS_PER_BATCH) -> tuple:
         """Legacy helper maintained for backward compatibility."""
-        ready, packets, ids, _, _ = self.fetch_current_session_sync_batch(current_session_id, max_packets)
+        ready, packets, ids, _, _, _ = self.fetch_unsynced_sync_batch(max_packets)
         return packets, ids
 
     def mark_telemetry_synced_to_sheets(self, doc_ids: list) -> bool:
@@ -745,10 +720,6 @@ def parse_arduino_line(line: str):
             print(f"[ARDUINO] [SEQUENCE GAP] Missing sequence: {missing_range} ({missing_count} missing packet(s))")
         elif seq <= last_received_seq:
             print(f"[ARDUINO] [SEQUENCE RESET] Hardware sequence reset: SEQ {seq} after SEQ {last_received_seq}")
-            old_session_id = current_session_id
-            current_session_id = create_new_session_id()
-            packet_data["session_id"] = current_session_id
-            print(f"[ARDUINO] Started new telemetry session: OLD={old_session_id} -> NEW={current_session_id}")
             last_received_seq = None
 
     last_received_seq = seq
@@ -818,24 +789,14 @@ def batch_uploader_worker():
 # ==============================================================================
 def mongo_to_sheets_sync_worker():
     """
-    Worker thread: Session-aware batch synchronization from MongoDB Atlas -> Google Sheets.
-    Pushes a batch of telemetry records collected during every 120-second time window for the CURRENT active session.
+    Worker thread: 120-second batch synchronization from MongoDB Atlas -> Google Sheets.
+    Pushes whatever telemetry records accumulated during every 120-second window.
     Enforces rolling 10-minute window retention in Google Sheets (~5 batches).
     """
-    last_logged_backlog_session = None
-
     while is_running:
         try:
             if MONGODB_URI and WEB_APP_URL:
-                active_session = current_session_id
-
-                if last_logged_backlog_session != active_session:
-                    if mongo_manager.check_old_session_backlog(active_session):
-                        print(f"[MONGODB SYNC] Old unsynced records exist in previous sessions; they will not block current-session synchronization.")
-                    last_logged_backlog_session = active_session
-
-                ready, unsynced_packets, fetched_doc_ids, total_avail, elapsed_sec, reason = mongo_manager.fetch_current_session_sync_batch(
-                    session_id=active_session,
+                ready, unsynced_packets, fetched_doc_ids, total_avail, elapsed_sec, reason = mongo_manager.fetch_unsynced_sync_batch(
                     target_batch_size=MAX_SYNC_PACKETS_PER_BATCH,
                     batch_window_sec=SYNC_INTERVAL_SEC
                 )
@@ -850,9 +811,8 @@ def mongo_to_sheets_sync_worker():
                     min_ts = timestamps[0] if timestamps else "N/A"
                     max_ts = timestamps[-1] if timestamps else "N/A"
 
-                    print(f"[MONGODB SYNC] Active session: {active_session}")
                     print(f"[MONGODB SYNC] 120-second time window complete ({int(elapsed_sec)}s elapsed)")
-                    print(f"[MONGODB SYNC] Pushing {len(unsynced_packets)} telemetry record(s) collected to Google Sheets")
+                    print(f"[MONGODB SYNC] Pushing {len(unsynced_packets)} telemetry record(s) to Google Sheets")
                     print(f"[MONGODB SYNC] Batch: {seq_str} | Time: {min_ts} → {max_ts}")
 
                     payload = {
@@ -883,10 +843,10 @@ def mongo_to_sheets_sync_worker():
 
                                 if fetched_doc_ids:
                                     mongo_manager.mark_telemetry_synced_to_sheets(fetched_doc_ids)
-                                    print(f"[MONGODB SYNC] Marked {seq_str} as synced")
+                                    print(f"[MONGODB SYNC] Marked {len(unsynced_packets)} records as synced ✓")
 
                                 if max_seq is not None:
-                                    mongo_manager.update_sync_state(active_session, max_seq, count, pruned, "SUCCESS")
+                                    mongo_manager.update_sync_state(current_session_id, max_seq, count, pruned, "SUCCESS")
 
                                 print(f"[MONGODB SYNC] 120-Second Batch Sync Complete: {count} packet(s) synced. Pruned: {pruned}, Retained: {retained} rows ✓")
 
@@ -896,20 +856,19 @@ def mongo_to_sheets_sync_worker():
                                 err_msg = f"Google Sheets sync rejected payload: {res_json.get('message', res_json)}"
                                 print(f"[MONGODB SYNC] {err_msg}")
                                 if max_seq is not None:
-                                    mongo_manager.update_sync_state(active_session, max_seq, 0, 0, "ERROR", err_msg)
+                                    mongo_manager.update_sync_state(current_session_id, max_seq, 0, 0, "ERROR", err_msg)
                         except Exception as pe:
                             err_msg = f"Response parse error: {pe}"
                             print(f"[MONGODB SYNC] {err_msg}")
                             if max_seq is not None:
-                                mongo_manager.update_sync_state(active_session, max_seq, 0, 0, "ERROR", err_msg)
+                                mongo_manager.update_sync_state(current_session_id, max_seq, 0, 0, "ERROR", err_msg)
                     else:
                         err_msg = f"Google Apps Script returned HTTP {response.status_code}"
                         print(f"[MONGODB SYNC] {err_msg}")
                         if max_seq is not None:
-                            mongo_manager.update_sync_state(active_session, max_seq, 0, 0, "ERROR", err_msg)
+                            mongo_manager.update_sync_state(current_session_id, max_seq, 0, 0, "ERROR", err_msg)
                 else:
                     if total_avail > 0:
-                        print(f"[MONGODB SYNC] Active session: {active_session}")
                         print(f"[MONGODB SYNC] Batch collecting: {total_avail} records ({int(elapsed_sec)}s/120s elapsed)")
                         print(f"[MONGODB SYNC] Waiting for 120-second window to complete...")
 

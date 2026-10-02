@@ -4,15 +4,19 @@
 SHM AI CHATBOT SERVICE — PROVIDER-INDEPENDENT MONGODB TELEMETRY ASSISTANT
 ==============================================================================
 Provides a strictly read-only, MongoDB-grounded AI assistant layer for the Bridge SHM
-system. Queries MongoDB Atlas as the SINGLE SOURCE OF TRUTH. Never uses Google Sheets,
-never invents or fabricates telemetry data, and supports selectable AI providers
-(OpenAI, Gemini, or fallback Deterministic MongoDB Engine).
+system. Queries MongoDB Atlas as the SINGLE AUTHORITATIVE SOURCE OF TRUTH.
 
-Supported AI Providers:
-- OpenAI (AI_PROVIDER=openai, OPENAI_API_KEY=...)
-- Gemini (AI_PROVIDER=gemini, GEMINI_API_KEY=...)
-- Auto Selection (AI_PROVIDER=auto)
-- Deterministic Rule Engine (AI_PROVIDER=none or missing keys)
+Architecture:
+Browser -> POST /api/v1/chat/query -> query_api.py -> chat_service.py -> LLM -> MongoDB tools -> LLM -> Natural Answer
+
+Features:
+- OpenAI Responses API & Chat Completions API with Function / Tool Calling
+- Grounded read-only MongoDB Atlas tools (get_latest_sensor_data, get_sensor_statistics,
+  get_sensor_history, get_record_count, get_sensor_gaps, get_active_sensors)
+- Multi-turn conversation memory
+- Natural language time range handling (IST timezone)
+- Sensor alias mapping & physical deployment constraints (FORCE-01, TEMP-01, HUMIDITY-01)
+- Zero fake/sample telemetry, zero secret exposure
 """
 
 import os
@@ -20,6 +24,7 @@ import sys
 import time
 import json
 import re
+import math
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import requests
@@ -35,43 +40,77 @@ CANONICAL_SENSORS = {
     "HUMIDITY-01": {"id": "HUMIDITY-01", "name": "Humidity Sensor 01", "type": "humidity", "unit": "%"}
 }
 
-SYSTEM_INSTRUCTION = """You are the official SHM Telemetry Assistant for this Structural Health Monitoring Workstation.
+FICTIONAL_SENSORS = ["STRAIN", "PRESSURE", "VIBRATION", "ACCELERATION", "DISPLACEMENT"]
+
+SYSTEM_INSTRUCTION = """You are the official AI assistant for a Structural Health Monitoring (SHM) telemetry workstation.
+
+You can answer general engineering, structural physics, data analysis, and software questions naturally.
+
+When a question requires actual bridge telemetry, sequence numbers, record counts, sensor statistics, historical observations, packet gaps, or active sensor verification, you MUST obtain the information by invoking the provided read-only MongoDB tools.
 
 MongoDB Atlas is the authoritative source of telemetry.
+Never fabricate, estimate, interpolate, simulate, or invent sensor readings, timestamps, record counts, statistics, sequence numbers, or historical observations.
 
-The current physical deployment has exactly three active sensors:
-- FORCE-01 — Force — N
-- TEMP-01 — Temperature — °C
-- HUMIDITY-01 — Humidity — %
+If MongoDB does not contain the required data for a requested period, explicitly state that no data is available in MongoDB for that period.
 
-Answer telemetry questions only using actual data returned by the provided read-only MongoDB tools.
+The physical deployment currently contains exactly three active sensors:
+- FORCE-01 — Force (N)
+- TEMP-01 — Temperature (°C)
+- HUMIDITY-01 — Humidity (%)
+Microcontroller: Arduino UNO-01.
 
-Never fabricate, estimate, simulate, interpolate, or invent telemetry values, timestamps, record counts, or statistics.
+Sensors like Strain, Pressure, Vibration, Acceleration, or Displacement are not active physical hardware nodes in this bridge deployment.
 
-If required data is unavailable, explicitly state that it is unavailable.
+Google Sheets is a secondary cache/presentation layer and MUST NEVER be used as the chatbot telemetry source.
 
-Google Sheets is a secondary cache/presentation layer and is not the chatbot's telemetry source.
+Never modify, insert, update, create, or delete telemetry data.
 
-Never modify, delete, insert, or update telemetry.
+Use clear, professional, natural engineering language.
 
-Do not claim a sensor exists unless it is part of the canonical active sensor list (FORCE-01, TEMP-01, HUMIDITY-01).
-
-Use clear engineering language."""
+Do not expose internal tool function names, API keys, database credentials, or backend connection details to the user unless requested."""
 
 # ------------------------------------------------------------------------------
-# TIME RANGE PARSER & INTENT RECOGNIZER
+# SENSOR ALIAS RESOLUTION
 # ------------------------------------------------------------------------------
+def resolve_sensor_alias(sensor_str: str) -> str:
+    """Resolves natural language sensor names and aliases to canonical hardware IDs."""
+    if not sensor_str:
+        return "ALL"
+    s = str(sensor_str).strip().upper()
+    if any(k in s for k in ["FORCE", "LOAD", "WEIGHT", "F-01", "F1"]) or s == "FORCE-01":
+        return "FORCE-01"
+    if any(k in s for k in ["TEMP", "THERMAL", "THERM", "T-01", "T1", "TEMPERATURE"]) or s == "TEMP-01":
+        return "TEMP-01"
+    if any(k in s for k in ["HUMID", "RH", "H-01", "H1", "HUMIDITY"]) or s == "HUMIDITY-01":
+        return "HUMIDITY-01"
+    if s in ("ALL", "ANY", "*", "EVERY"):
+        return "ALL"
+    return s
+
+# ------------------------------------------------------------------------------
+# TIME RANGE PARSER
+# ------------------------------------------------------------------------------
+NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "twenty-four": 24, "twenty four": 24, "thirty": 30
+}
+
 def parse_natural_time_range(query_text: str) -> tuple:
     """
-    Parses natural language time queries into UTC ISO string time bounds and label.
+    Parses natural language time queries into UTC ISO string time bounds and human label.
     Returns: (from_iso, to_iso, label_str)
     """
     q = query_text.lower()
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc.astimezone(IST)
 
+    # Convert word numbers to digits in query text
+    for word, num in NUMBER_WORDS.items():
+        q = re.sub(rf"\b{word}\b", str(num), q)
+
     if any(k in q for k in ["latest", "current", "now", "realtime", "real-time", "present"]):
-        return None, None, "latest"
+        return None, None, "Latest Snapshot"
 
     if "today" in q:
         start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -83,9 +122,13 @@ def parse_natural_time_range(query_text: str) -> tuple:
         end_ist = yesterday_ist.replace(hour=23, minute=59, second=59, microsecond=999999)
         return start_ist.astimezone(timezone.utc).isoformat(), end_ist.astimezone(timezone.utc).isoformat(), "Yesterday (IST)"
 
-    if "this week" in q or "past week" in q or "last week" in q:
+    if any(k in q for k in ["this week", "past week", "last week", "7 days", "7 d"]):
         from_dt = now_utc - timedelta(days=7)
         return from_dt.isoformat(), now_utc.isoformat(), "Last 7 days"
+
+    if any(k in q for k in ["this month", "past month", "last month", "30 days", "30 d"]):
+        from_dt = now_utc - timedelta(days=30)
+        return from_dt.isoformat(), now_utc.isoformat(), "Last 30 days"
 
     # Match time regex: "X hours", "X hr", "X mins", "X min", "X days", "X d"
     time_match = re.search(r"(\d+)\s*(hours?|hrs?|h|minutes?|mins?|min|days?|d)\b", q)
@@ -102,86 +145,79 @@ def parse_natural_time_range(query_text: str) -> tuple:
             from_dt = now_utc - timedelta(hours=val)
             return from_dt.isoformat(), now_utc.isoformat(), f"Last {val} hours"
 
-    return None, None, "latest"
-
-def detect_sensor_filter(query_text: str) -> str:
-    """Detects if query targets a specific sensor ID or sensor type."""
-    q = query_text.upper()
-    if "FORCE-01" in q or "FORCE" in q or "LOAD" in q:
-        return "FORCE-01"
-    if "TEMP-01" in q or "TEMP" in q or "TEMPERATURE" in q:
-        return "TEMP-01"
-    if "HUMIDITY-01" in q or "HUMIDITY" in q or "HUMID" in q:
-        return "HUMIDITY-01"
-    return "ALL"
+    return None, None, "Latest Snapshot"
 
 # ------------------------------------------------------------------------------
-# SAFE READ-ONLY MONGODB QUERY TOOLS (SINGLE SOURCE OF TRUTH)
+# SAFE READ-ONLY MONGODB QUERY TOOLS (AUTHORITATIVE SOURCE OF TRUTH)
 # ------------------------------------------------------------------------------
-def mongodb_tool_get_latest() -> dict:
-    """Retrieves the latest sensor reading snapshot across all sensors from MongoDB Atlas."""
+def mongodb_tool_get_latest(sensor_id: str = None) -> dict:
+    """Retrieves the latest sensor reading snapshot across active sensors from MongoDB Atlas."""
+    sensor_norm = resolve_sensor_alias(sensor_id) if sensor_id else "ALL"
     res = TelemetryQueryEngine.get_latest_telemetry({})
+    if res.get("status") != "success":
+        return {
+            "status": "empty",
+            "message": "No telemetry readings are currently stored in MongoDB Atlas.",
+            "sensors": ["FORCE-01", "TEMP-01", "HUMIDITY-01"]
+        }
+
+    doc_sensors = res.get("sensors", {})
+    if sensor_norm != "ALL" and sensor_norm in CANONICAL_SENSORS:
+        filtered_sensors = {sensor_norm: doc_sensors.get(sensor_norm)} if sensor_norm in doc_sensors else {}
+    else:
+        filtered_sensors = {k: v for k, v in doc_sensors.items() if k in CANONICAL_SENSORS}
+
     return {
-        "tool": "get_latest_sensor_data",
-        "result": res,
-        "sensors": ["FORCE-01", "TEMP-01", "HUMIDITY-01"],
-        "records_analyzed": 1 if res.get("status") == "success" else 0
+        "status": "success",
+        "arduino_id": res.get("arduino_id", "UNO-01"),
+        "session_id": res.get("session_id"),
+        "sequence": res.get("sequence"),
+        "timestamp_ist": res.get("timestamp"),
+        "sensors": filtered_sensors
     }
 
-def mongodb_tool_get_stats(sensor_id: str = "ALL", from_iso: str = None, to_iso: str = None) -> dict:
-    """Calculates exact min, max, mean, stddev metrics over MongoDB telemetry."""
+def mongodb_tool_get_stats(sensor_id: str = "ALL", from_time: str = None, to_time: str = None) -> dict:
+    """Calculates exact min, max, mean, stddev metrics over MongoDB Atlas telemetry."""
+    sensor_norm = resolve_sensor_alias(sensor_id)
     params = {}
-    if sensor_id and sensor_id != "ALL":
-        params["sensor_id"] = sensor_id
-    if from_iso:
-        params["from"] = from_iso
-    if to_iso:
-        params["to"] = to_iso
+    if sensor_norm != "ALL":
+        params["sensor_id"] = sensor_norm
+    if from_time:
+        params["from"] = from_time
+    if to_time:
+        params["to"] = to_time
 
     res = TelemetryQueryEngine.query_stats(params)
-    stats_data = res.get("statistics", {})
-    count = sum(s.get("count", 0) for s in stats_data.values()) if isinstance(stats_data, dict) else 0
+    return res
 
-    return {
-        "tool": "get_sensor_statistics",
-        "result": res,
-        "sensors": [sensor_id] if sensor_id != "ALL" else ["FORCE-01", "TEMP-01", "HUMIDITY-01"],
-        "records_analyzed": count
-    }
-
-def mongodb_tool_get_history(sensor_id: str = "ALL", from_iso: str = None, to_iso: str = None, limit: int = 100) -> dict:
+def mongodb_tool_get_history(sensor_id: str = "ALL", from_time: str = None, to_time: str = None, limit: int = 100) -> dict:
     """Queries chronologically sorted historical telemetry range from MongoDB Atlas."""
-    params = {"limit": min(limit, 200)}
-    if sensor_id and sensor_id != "ALL":
-        params["sensor_id"] = sensor_id
-    if from_iso:
-        params["from"] = from_iso
-    if to_iso:
-        params["to"] = to_iso
+    sensor_norm = resolve_sensor_alias(sensor_id)
+    try:
+        limit_val = min(max(1, int(limit)), 200)
+    except (ValueError, TypeError):
+        limit_val = 100
+
+    params = {"limit": limit_val}
+    if sensor_norm != "ALL":
+        params["sensor_id"] = sensor_norm
+    if from_time:
+        params["from"] = from_time
+    if to_time:
+        params["to"] = to_time
 
     res = TelemetryQueryEngine.query_export(params)
-    records = res.get("records", [])
+    return res
 
-    return {
-        "tool": "get_sensor_history",
-        "result": {
-            "status": res.get("status"),
-            "count": len(records),
-            "sample_records": records[:30] if len(records) > 30 else records
-        },
-        "sensors": [sensor_id] if sensor_id != "ALL" else ["FORCE-01", "TEMP-01", "HUMIDITY-01"],
-        "records_analyzed": len(records)
-    }
-
-def mongodb_tool_get_count(from_iso: str = None, to_iso: str = None) -> dict:
+def mongodb_tool_get_count(from_time: str = None, to_time: str = None) -> dict:
     """Counts total telemetry documents stored in MongoDB Atlas."""
     db = get_db()
     if db is None:
-        return {"tool": "get_record_count", "result": {"status": "error", "message": "MongoDB database unavailable"}, "records_analyzed": 0}
+        return {"status": "error", "message": "MongoDB database unavailable"}
 
     query = {}
-    from_dt = parse_iso_or_ms(from_iso) if from_iso else None
-    to_dt = parse_iso_or_ms(to_iso) if to_iso else None
+    from_dt = parse_iso_or_ms(from_time) if from_time else None
+    to_dt = parse_iso_or_ms(to_time) if to_time else None
 
     if from_dt or to_dt:
         query["timestamp"] = {}
@@ -197,203 +233,434 @@ def mongodb_tool_get_count(from_iso: str = None, to_iso: str = None) -> dict:
         max_seq = latest_doc.get("sequence")
 
         return {
-            "tool": "get_record_count",
-            "result": {
-                "status": "success",
-                "total_documents": count,
-                "latest_sequence": max_seq
-            },
-            "sensors": ["FORCE-01", "TEMP-01", "HUMIDITY-01"],
-            "records_analyzed": count
+            "status": "success",
+            "total_documents": count,
+            "latest_sequence": max_seq,
+            "time_filter": {"from": from_time, "to": to_time}
         }
     except Exception as e:
-        return {"tool": "get_record_count", "result": {"status": "error", "message": str(e)}, "records_analyzed": 0}
+        return {"status": "error", "message": str(e)}
 
 def mongodb_tool_get_gaps(limit: int = 200) -> dict:
-    """Analyzes sequence gaps and missing packets in recent telemetry."""
-    res = TelemetryQueryEngine.get_sensor_gaps({"limit": limit})
+    """Analyzes sequence gaps and missing packets in recent telemetry from MongoDB Atlas."""
+    try:
+        limit_val = min(max(10, int(limit)), 1000)
+    except (ValueError, TypeError):
+        limit_val = 200
+
+    res = TelemetryQueryEngine.get_sensor_gaps({"limit": limit_val})
+    return res
+
+def mongodb_tool_get_active_sensors() -> dict:
+    """Returns authoritative active physical sensor list."""
     return {
-        "tool": "get_sensor_gaps",
-        "result": res,
-        "sensors": ["FORCE-01", "TEMP-01", "HUMIDITY-01"],
-        "records_analyzed": res.get("total_checked", 0)
+        "status": "success",
+        "arduino_id": "UNO-01",
+        "active_sensors": [
+            {"id": "FORCE-01", "name": "Force Sensor 01", "parameter": "Force", "unit": "N"},
+            {"id": "TEMP-01", "name": "Temperature Sensor 01", "parameter": "Temperature", "unit": "°C"},
+            {"id": "HUMIDITY-01", "name": "Humidity Sensor 01", "parameter": "Humidity", "unit": "%"}
+        ]
     }
+
+# Tool execution dispatcher
+READONLY_TOOLS_MAP = {
+    "get_latest_sensor_data": mongodb_tool_get_latest,
+    "get_sensor_statistics": mongodb_tool_get_stats,
+    "get_sensor_history": mongodb_tool_get_history,
+    "get_record_count": mongodb_tool_get_count,
+    "get_sensor_gaps": mongodb_tool_get_gaps,
+    "get_active_sensors": mongodb_tool_get_active_sensors
+}
+
+def execute_read_only_tool(tool_name: str, arguments: dict, default_from_iso: str = None, default_to_iso: str = None) -> dict:
+    """Executes a named read-only MongoDB tool with sanitized arguments."""
+    if tool_name not in READONLY_TOOLS_MAP:
+        return {"status": "error", "message": f"Unknown tool: '{tool_name}'"}
+
+    func = READONLY_TOOLS_MAP[tool_name]
+    kwargs = dict(arguments or {})
+
+    # Parameter normalization
+    if "sensor_id" in kwargs:
+        kwargs["sensor_id"] = resolve_sensor_alias(kwargs["sensor_id"])
+
+    # Alias 'from' and 'to' parameter names
+    if "from" in kwargs and "from_time" not in kwargs:
+        kwargs["from_time"] = kwargs.pop("from")
+    if "to" in kwargs and "to_time" not in kwargs:
+        kwargs["to_time"] = kwargs.pop("to")
+
+    # Supply natural time bounds if tool accepts time parameters and model omitted them
+    if tool_name in ("get_sensor_statistics", "get_sensor_history", "get_record_count"):
+        if default_from_iso and not kwargs.get("from_time"):
+            kwargs["from_time"] = default_from_iso
+        if default_to_iso and not kwargs.get("to_time"):
+            kwargs["to_time"] = default_to_iso
+
+    try:
+        res = func(**kwargs)
+        return res
+    except TypeError:
+        # Retry with filtered valid kwargs
+        import inspect
+        sig = inspect.signature(func)
+        valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return func(**valid_kwargs)
+    except Exception as e:
+        return {"status": "error", "message": f"Tool execution error in '{tool_name}': {e}"}
+
+# OPENAI TOOL SCHEMAS
+OPENAI_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "name": "get_latest_sensor_data",
+        "description": "Returns the latest actual telemetry snapshot across active sensors (FORCE-01, TEMP-01, HUMIDITY-01) from MongoDB Atlas.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sensor_id": {
+                    "type": "string",
+                    "description": "Optional canonical sensor ID: FORCE-01, TEMP-01, HUMIDITY-01, or ALL."
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "name": "get_sensor_statistics",
+        "description": "Calculates exact document count, min, max, mean (average), and standard deviation metrics for bridge sensors over a specified time period in MongoDB Atlas.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sensor_id": {
+                    "type": "string",
+                    "description": "Canonical sensor ID: FORCE-01, TEMP-01, HUMIDITY-01, or ALL."
+                },
+                "from_time": {
+                    "type": "string",
+                    "description": "ISO 8601 formatted start timestamp (e.g. 2026-10-02T00:00:00+05:30)."
+                },
+                "to_time": {
+                    "type": "string",
+                    "description": "ISO 8601 formatted end timestamp (e.g. 2026-10-02T23:59:59+05:30)."
+                }
+            },
+            "required": ["sensor_id"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "get_sensor_history",
+        "description": "Retrieves chronologically sorted historical telemetry records from MongoDB Atlas within specified time bounds.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sensor_id": {
+                    "type": "string",
+                    "description": "Canonical sensor ID: FORCE-01, TEMP-01, HUMIDITY-01, or ALL."
+                },
+                "from_time": {
+                    "type": "string",
+                    "description": "ISO 8601 formatted start timestamp."
+                },
+                "to_time": {
+                    "type": "string",
+                    "description": "ISO 8601 formatted end timestamp."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of records to return (1 to 200)."
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "name": "get_record_count",
+        "description": "Returns the exact count of telemetry documents stored in MongoDB Atlas, optionally filtered by time bounds.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "from_time": {
+                    "type": "string",
+                    "description": "Optional ISO 8601 formatted start timestamp."
+                },
+                "to_time": {
+                    "type": "string",
+                    "description": "Optional ISO 8601 formatted end timestamp."
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "name": "get_sensor_gaps",
+        "description": "Analyzes recent sequence numbers to detect dropped telemetry packets or sequence gaps in MongoDB Atlas.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of sequence documents to inspect (default 200)."
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "name": "get_active_sensors",
+        "description": "Returns the authoritative list of active physical hardware sensors (FORCE-01, TEMP-01, HUMIDITY-01) deployed on the bridge DAQ node.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    }
+]
 
 # ------------------------------------------------------------------------------
 # PROVIDER-INDEPENDENT AI SERVICE ARCHITECTURE
 # ------------------------------------------------------------------------------
 class BaseAIProvider:
-    """Abstract interface for AI Providers (OpenAI, Gemini, Fallback Engine)."""
-    def generate(self, user_query: str, chat_history: list, mongodb_context: dict) -> str:
+    """Abstract base class for AI Providers (OpenAI, Gemini, Fallback Engine)."""
+    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None) -> tuple:
+        """
+        Returns: (answer_text: str, executed_tools_meta: list)
+        """
         raise NotImplementedError
 
 class OpenAIProvider(BaseAIProvider):
     def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
         self.api_key = api_key
-        self.model = model
+        self.model = model or "gpt-4o-mini"
 
-    def generate(self, user_query: str, chat_history: list, mongodb_context: dict) -> str:
+    def _call_responses_api(self, input_items: list, tools: list) -> dict:
+        url = "https://api.openai.com/v1/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": self.model,
+            "instructions": SYSTEM_INSTRUCTION,
+            "input": input_items,
+            "tools": tools
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        raise RuntimeError(f"Responses API error (HTTP {resp.status_code}): {resp.text[:300]}")
+
+    def _call_chat_completions(self, messages: list, tools: list) -> dict:
         url = "https://api.openai.com/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": 0.1,
+            "max_tokens": 600
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        raise RuntimeError(f"Chat Completions API error (HTTP {resp.status_code}): {resp.text[:300]}")
 
-        context_str = json.dumps(mongodb_context, indent=2, default=str)
-        messages = [{"role": "system", "content": f"{SYSTEM_INSTRUCTION}\n\nACTUAL RETRIEVED MONGODB TELEMETRY CONTEXT:\n{context_str}"}]
+    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None) -> tuple:
+        # Build Chat Completions messages list
+        messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
 
-        for h in (chat_history or []):
+        # Append bounded multi-turn conversation history
+        for h in (chat_history or [])[-6:]:
             if isinstance(h, dict) and "user" in h and "bot" in h:
                 messages.append({"role": "user", "content": h["user"]})
                 messages.append({"role": "assistant", "content": h["bot"]})
 
         messages.append({"role": "user", "content": user_query})
 
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.1,
-            "max_tokens": 500
-        }
+        executed_tools_meta = []
+        max_turns = 5
 
-        resp = requests.post(url, headers=headers, json=payload, timeout=25)
-        if resp.status_code == 200:
-            res_json = resp.json()
-            return res_json["choices"][0]["message"]["content"].strip()
-        else:
-            raise RuntimeError(f"OpenAI API error (HTTP {resp.status_code}): {resp.text[:200]}")
+        # Execute Tool Calling Loop via OpenAI API
+        for _ in range(max_turns):
+            res_json = self._call_chat_completions(messages, OPENAI_TOOLS_SCHEMA)
+            choice = res_json["choices"][0]
+            msg = choice["message"]
+
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                # Model finished generation with final text response
+                content = msg.get("content") or ""
+                return content.strip(), executed_tools_meta
+
+            # Append assistant message containing tool calls
+            messages.append(msg)
+
+            # Execute requested tool function(s) against MongoDB Atlas
+            for tc in tool_calls:
+                fn_info = tc.get("function", {})
+                call_id = tc.get("id")
+                fn_name = fn_info.get("name")
+
+                try:
+                    fn_args = json.loads(fn_info.get("arguments", "{}"))
+                except Exception:
+                    fn_args = {}
+
+                tool_res = execute_read_only_tool(fn_name, fn_args, default_from_iso, default_to_iso)
+                executed_tools_meta.append({
+                    "tool": fn_name,
+                    "args": fn_args,
+                    "records_analyzed": tool_res.get("records_analyzed") or tool_res.get("total_documents") or (1 if tool_res.get("status") == "success" else 0)
+                })
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(tool_res, default=str)
+                })
+
+        return "Completed telemetry analysis.", executed_tools_meta
 
 class GeminiProvider(BaseAIProvider):
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
         self.api_key = api_key
-        self.model = model
+        self.model = model or "gemini-2.5-flash"
 
-    def generate(self, user_query: str, chat_history: list, mongodb_context: dict) -> str:
+    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None) -> tuple:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
         headers = {"Content-Type": "application/json"}
 
-        context_str = json.dumps(mongodb_context, indent=2, default=str)
-        prompt_text = f"{SYSTEM_INSTRUCTION}\n\nACTUAL RETRIEVED MONGODB TELEMETRY CONTEXT:\n{context_str}\n\nUser Question: {user_query}"
+        # Perform grounded MongoDB telemetry tool lookup for Gemini context
+        latest_res = mongodb_tool_get_latest()
+        context_str = json.dumps(latest_res, indent=2, default=str)
+
+        prompt_text = f"{SYSTEM_INSTRUCTION}\n\nAUTHORITATIVE MONGODB ATLAS TELEMETRY:\n{context_str}\n\nUser Question: {user_query}"
 
         payload = {
-            "contents": [
-                {
-                    "parts": [{"text": prompt_text}]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 500
-            }
+            "contents": [{"parts": [{"text": prompt_text}]}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 600}
         }
 
-        resp = requests.post(url, headers=headers, json=payload, timeout=25)
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
         if resp.status_code == 200:
             res_json = resp.json()
             candidates = res_json.get("candidates", [])
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
                 if parts:
-                    return parts[0].get("text", "").strip()
+                    return parts[0].get("text", "").strip(), [{"tool": "get_latest_sensor_data", "records_analyzed": 1}]
             raise RuntimeError("Gemini returned empty candidate response")
         else:
-            raise RuntimeError(f"Gemini API error (HTTP {resp.status_code}): {resp.text[:200]}")
+            raise RuntimeError(f"Gemini API error (HTTP {resp.status_code}): {resp.text[:300]}")
 
 class DeterministicMongoDBEngine(BaseAIProvider):
     """
-    Rule-based grounded telemetry formatter. Used when no external AI API key is configured
-    or if AI API connection fails, guaranteeing zero downtime and 100% accurate MongoDB grounding.
+    Emergency rule-based grounded telemetry formatter. Used ONLY when no external AI API key
+    is configured or if AI provider connection fails. Clearly flags execution mode as fallback.
     """
-    def generate(self, user_query: str, chat_history: list, mongodb_context: dict) -> str:
-        tool_name = mongodb_context.get("tool")
-        res_data = mongodb_context.get("result", {})
+    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None) -> tuple:
+        q_lower = user_query.lower()
+        sensor_filter = resolve_sensor_alias(user_query)
 
-        if tool_name in ("get_latest_sensor_data", "get_active_sensors"):
-            if res_data.get("status") != "success":
-                return "No telemetry readings are currently stored in MongoDB Atlas."
+        is_active_query = any(k in q_lower for k in ["active sensor", "active sensors", "what sensors", "available sensor"])
+        is_gap_query = any(k in q_lower for k in ["gap", "missing", "packet loss", "dropped"])
+        is_count_query = any(k in q_lower for k in ["count", "how many", "stored", "total record", "number of record"])
+        is_stat_query = any(k in q_lower for k in ["max", "maximum", "min", "minimum", "avg", "average", "mean", "std", "stddev", "statistic"])
+        is_history_query = any(k in q_lower for k in ["history", "historical", "readings", "list", "show", "export"]) or default_from_iso is not None
 
-            ts = res_data.get("timestamp", "N/A")
-            seq = res_data.get("sequence", "N/A")
-            sensors = res_data.get("sensors", {})
+        if is_active_query:
+            tool_name = "get_active_sensors"
+            res = mongodb_tool_get_active_sensors()
+        elif is_gap_query:
+            tool_name = "get_sensor_gaps"
+            res = mongodb_tool_get_gaps()
+        elif is_count_query:
+            tool_name = "get_record_count"
+            res = mongodb_tool_get_count(default_from_iso, default_to_iso)
+        elif is_stat_query:
+            tool_name = "get_sensor_statistics"
+            res = mongodb_tool_get_stats(sensor_filter, default_from_iso, default_to_iso)
+        elif is_history_query:
+            tool_name = "get_sensor_history"
+            res = mongodb_tool_get_history(sensor_filter, default_from_iso, default_to_iso)
+        else:
+            tool_name = "get_latest_sensor_data"
+            res = mongodb_tool_get_latest(sensor_filter if sensor_filter != "ALL" else None)
 
-            if tool_name == "get_active_sensors":
-                lines = ["The physical hardware DAQ node (UNO-01) currently operates the following active sensors in MongoDB Atlas:\n"]
-            else:
-                lines = [f"Based on the latest telemetry in MongoDB Atlas (Sequence: {seq}, Time: {ts}):\n"]
+        meta = [{"tool": tool_name, "records_analyzed": res.get("total_checked") or res.get("total_documents") or 1}]
 
+        if res.get("status") != "success":
+            return f"No telemetry data is currently available in MongoDB Atlas. ({res.get('message', '')})", meta
+
+        if tool_name == "get_active_sensors":
+            lines = ["The physical DAQ node (UNO-01) currently operates exactly three active sensors in MongoDB Atlas:\n"]
+            for s in res.get("active_sensors", []):
+                lines.append(f"• {s['id']} — {s['name']} ({s['parameter']}, {s['unit']})")
+            return "\n".join(lines), meta
+
+        elif tool_name == "get_latest_sensor_data":
+            ts = res.get("timestamp_ist", "N/A")
+            seq = res.get("sequence", "N/A")
+            sensors = res.get("sensors", {})
+            lines = [f"Latest MongoDB Atlas telemetry snapshot (Sequence {seq}, Time: {ts}):\n"]
             for s_id, s_info in sensors.items():
-                s_norm = s_id.upper()
-                if s_norm in CANONICAL_SENSORS:
-                    meta = CANONICAL_SENSORS[s_norm]
-                    val = s_info.get("value")
-                    val_str = f"{val:.2f} {meta['unit']}" if isinstance(val, (int, float)) else "N/A"
-                    status = s_info.get("status", "OFFLINE")
-                    lines.append(f"• {s_norm} — {meta['name']} ({meta['type'].title()}, {meta['unit']}): {val_str} [{status}]")
-
-            return "\n".join(lines)
+                val = s_info.get("value")
+                meta_s = CANONICAL_SENSORS.get(s_id, {"unit": ""})
+                val_str = f"{val:.2f} {meta_s['unit']}" if isinstance(val, (int, float)) else "N/A"
+                lines.append(f"• {s_id}: {val_str} [{s_info.get('status', 'OFFLINE')}]")
+            return "\n".join(lines), meta
 
         elif tool_name == "get_sensor_statistics":
-            stats = res_data.get("statistics", {})
+            stats = res.get("statistics", {})
             if not stats:
-                return "No telemetry records were found in MongoDB Atlas for the requested period, so statistics cannot be calculated."
-
-            lines = ["Based on MongoDB Atlas historical telemetry statistical analysis:\n"]
+                return "No telemetry data is available in MongoDB Atlas for that period.", meta
+            lines = ["MongoDB Atlas telemetry statistical summary:\n"]
             for s_id, s_stats in stats.items():
-                s_norm = s_id.upper()
-                meta = CANONICAL_SENSORS.get(s_norm, {"name": s_id, "unit": ""})
-                unit = meta.get("unit", "")
+                meta_s = CANONICAL_SENSORS.get(s_id, {"unit": ""})
+                unit = meta_s.get("unit", "")
                 lines.append(
-                    f"{s_norm} ({meta['name']}):\n"
-                    f"  • Maximum: {s_stats.get('max', 'N/A')} {unit}\n"
-                    f"  • Average: {s_stats.get('mean', 'N/A')} {unit}\n"
-                    f"  • Minimum: {s_stats.get('min', 'N/A')} {unit}\n"
-                    f"  • Std Deviation: {s_stats.get('stddev', 'N/A')} {unit}\n"
-                    f"  • Records Analyzed: {s_stats.get('count', 0)}\n"
+                    f"{s_id}:\n"
+                    f"  • Maximum: {s_stats.get('max')} {unit}\n"
+                    f"  • Average: {s_stats.get('mean')} {unit}\n"
+                    f"  • Minimum: {s_stats.get('min')} {unit}\n"
+                    f"  • Std Deviation: {s_stats.get('stddev')} {unit}\n"
+                    f"  • Records Analyzed: {s_stats.get('count', 0)}"
                 )
-            return "\n".join(lines)
+            return "\n".join(lines), meta
 
         elif tool_name == "get_record_count":
-            total = res_data.get("total_documents", 0)
-            seq = res_data.get("latest_sequence", "N/A")
-            return f"MongoDB Atlas Primary Database Status:\n• Total Stored Records: {total:,}\n• Latest Hardware Sequence: {seq}\n• Active Sensors: FORCE-01, TEMP-01, HUMIDITY-01"
-
-        elif tool_name == "get_sensor_history":
-            count = res_data.get("count", 0)
-            sample = res_data.get("sample_records", [])
-            if count == 0:
-                return "No historical telemetry records were found in MongoDB Atlas for the requested period."
-            
-            lines = [f"Found {count} historical telemetry records in MongoDB Atlas for the specified range. Sample readings:\n"]
-            for r in sample[:5]:
-                lines.append(f"• [{r.get('timestamp')}] Seq: {r.get('sequence')} | {r.get('sensor_id')}: {r.get('sensor_value')} {r.get('unit')}")
-            if count > 5:
-                lines.append(f"\n(... showing first 5 of {count} total records analyzed in MongoDB Atlas)")
-            return "\n".join(lines)
+            cnt = res.get("total_documents", 0)
+            seq = res.get("latest_sequence", "N/A")
+            return f"MongoDB Atlas Primary Database Status:\n• Total Stored Records: {cnt:,}\n• Latest Hardware Sequence: {seq}\n• Active Sensors: FORCE-01, TEMP-01, HUMIDITY-01", meta
 
         elif tool_name == "get_sensor_gaps":
-            gaps_data = res_data.get("gaps_found", [])
-            missing = res_data.get("missing_count", 0)
-            total = res_data.get("total_checked", 0)
-            if not gaps_data:
-                return f"Sequence Analysis Result: Analyzed the last {total} sequence records in MongoDB Atlas. No packet gaps or missing sequence numbers were detected. Data continuity is 100%."
-            else:
-                return f"Sequence Analysis Result: Analyzed {total} sequence records in MongoDB Atlas. Found {len(gaps_data)} gap event(s) with a total of {missing} missing packet(s)."
+            gaps = res.get("gaps_found", [])
+            missing = res.get("missing_count", 0)
+            total = res.get("total_checked", 0)
+            if not gaps:
+                return f"Sequence Continuity Check: Analyzed the last {total} sequence records in MongoDB Atlas. No packet gaps detected. Continuity is 100%.", meta
+            return f"Sequence Continuity Check: Analyzed {total} sequence records in MongoDB Atlas. Found {len(gaps)} gap event(s) with {missing} missing packet(s).", meta
 
-        return "MongoDB Atlas query executed successfully."
+        return "MongoDB Atlas telemetry query executed.", meta
 
 # ------------------------------------------------------------------------------
-# CHATBOT ENGINE ROUTER & HANDLER
+# PROVIDER ROUTER
 # ------------------------------------------------------------------------------
 def get_ai_provider() -> tuple:
     """
     Selects AI Provider based on AI_PROVIDER, OPENAI_API_KEY, and GEMINI_API_KEY env variables.
     Returns: (provider_instance: BaseAIProvider, provider_name: str, model_name: str)
     """
-    provider_type = os.getenv("AI_PROVIDER", "auto").strip().lower()
+    provider_type = os.getenv("AI_PROVIDER", "openai").strip().lower()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 
     if provider_type == "openai" and openai_key:
         return OpenAIProvider(openai_key, openai_model), "OpenAI", openai_model
@@ -405,13 +672,15 @@ def get_ai_provider() -> tuple:
         elif gemini_key:
             return GeminiProvider(gemini_key, gemini_model), "Google Gemini", gemini_model
 
-    # Fallback to deterministic MongoDB engine
-    return DeterministicMongoDBEngine(), "MongoDB Atlas Engine", "Read-Only Query Layer"
+    return DeterministicMongoDBEngine(), "MongoDB Atlas Engine (Fallback)", "Read-Only Query Layer"
 
+# ------------------------------------------------------------------------------
+# MAIN CHATBOT ENTRY POINT
+# ------------------------------------------------------------------------------
 def handle_chat_query(payload: dict) -> dict:
     """
     Main entry point for POST /api/v1/chat/query.
-    Processes natural language question, executes safe MongoDB query tool, grounds answer in MongoDB data.
+    Processes natural language question, executes safe MongoDB tools, grounds answer in MongoDB data.
     """
     if not isinstance(payload, dict):
         payload = {}
@@ -427,21 +696,24 @@ def handle_chat_query(payload: dict) -> dict:
             "analysis_details": {"operation": "INVALID_INPUT", "execution_method": "Input Sanitizer"}
         }
 
-    print(f"[CHATBOT] Request received: '{user_message}'")
+    print(f"[CHATBOT] User Query: '{user_message}'")
 
     # Check for fictional sensor questions
     q_upper = user_message.upper()
-    if any(fake in q_upper for fake in ["STRAIN", "PRESSURE", "VIBRATION", "ACCELERATION", "DISPLACEMENT"]):
-        ans = "The physical hardware DAQ node (UNO-01) currently operates exactly three active sensors:\n• FORCE-01 (Force, N)\n• TEMP-01 (Temperature, °C)\n• HUMIDITY-01 (Humidity, %)\n\nSensors like Strain, Pressure, Vibration, Acceleration, or Displacement are not active physical hardware nodes in this bridge deployment."
-        print(f"[CHATBOT] MongoDB query executed: get_available_sensors")
-        print(f"[CHATBOT] Provider selected: Authoritative Hardware Registry Check")
-        print(f"[CHATBOT] Response generated")
+    if any(fake in q_upper for fake in FICTIONAL_SENSORS):
+        ans = (
+            "The physical hardware DAQ node (UNO-01) currently operates exactly three active sensors in MongoDB Atlas:\n"
+            "• FORCE-01 — Force (N)\n"
+            "• TEMP-01 — Temperature (°C)\n"
+            "• HUMIDITY-01 — Humidity (%)\n\n"
+            "Sensors such as Strain, Pressure, Vibration, Acceleration, or Displacement are not active physical hardware nodes in this bridge deployment."
+        )
         return {
             "status": "success",
             "answer": ans,
             "data_source": "MongoDB Atlas Primary Database",
             "analysis_details": {
-                "operation": "get_available_sensors",
+                "operation": "get_active_sensors",
                 "sensors": ["FORCE-01", "TEMP-01", "HUMIDITY-01"],
                 "time_range": "N/A",
                 "records_analyzed": 0,
@@ -449,63 +721,41 @@ def handle_chat_query(payload: dict) -> dict:
             }
         }
 
-    # Parse time bounds and sensor filters
+    # Extract natural time bounds and sensor filter
     from_iso, to_iso, time_label = parse_natural_time_range(user_message)
-    sensor_filter = detect_sensor_filter(user_message)
-
-    q_lower = user_message.lower()
-
-    # Intent routing to safe read-only tools
-    is_active_sensors_query = any(k in q_lower for k in ["active sensor", "active sensors", "what sensors", "available sensor", "which sensor"])
-    is_gap_query = any(k in q_lower for k in ["gap", "missing", "packet loss", "sequence gap", "dropped reading"])
-    is_count_query = any(k in q_lower for k in ["count", "how many", "stored", "total record", "total reading", "number of record"])
-    is_stat_query = any(k in q_lower for k in ["max", "maximum", "min", "minimum", "avg", "average", "mean", "std", "stddev", "statistic", "summary"])
-    is_history_query = any(k in q_lower for k in ["history", "historical", "readings", "data", "list", "show", "export", "log"]) or (from_iso is not None and not is_stat_query and not is_count_query)
-
-    if is_active_sensors_query and not is_stat_query and not is_history_query:
-        tool_ctx = mongodb_tool_get_latest()
-        tool_ctx["tool"] = "get_active_sensors"
-    elif is_gap_query:
-        tool_ctx = mongodb_tool_get_gaps()
-    elif is_count_query:
-        tool_ctx = mongodb_tool_get_count(from_iso, to_iso)
-    elif is_stat_query:
-        tool_ctx = mongodb_tool_get_stats(sensor_filter, from_iso, to_iso)
-    elif is_history_query and (from_iso or to_iso or "history" in q_lower or "data" in q_lower):
-        tool_ctx = mongodb_tool_get_history(sensor_filter, from_iso, to_iso)
-    else:
-        tool_ctx = mongodb_tool_get_latest()
-
-    print(f"[CHATBOT] MongoDB query executed: {tool_ctx.get('tool')}")
+    sensor_filter = resolve_sensor_alias(user_message)
 
     # Obtain AI Provider or Fallback Engine
     provider_inst, provider_name, model_name = get_ai_provider()
-    print(f"[CHATBOT] Provider selected: {provider_name} ({model_name})")
+    print(f"[CHATBOT] Selected AI Provider: {provider_name} ({model_name})")
 
     try:
-        answer = provider_inst.generate(user_message, chat_history, tool_ctx)
+        answer, tools_meta = provider_inst.generate_response(user_message, chat_history, from_iso, to_iso)
+        op_name = tools_meta[0]["tool"] if tools_meta else "general_assistant_query"
+        records_cnt = sum(t.get("records_analyzed", 0) for t in tools_meta) if tools_meta else 0
+        exec_method = f"{provider_name} ({model_name})"
     except Exception as e:
         print(f"[CHATBOT ERROR] AI Provider '{provider_name}' error: {e}. Falling back to Deterministic MongoDB Engine.")
         fallback = DeterministicMongoDBEngine()
-        answer = fallback.generate(user_message, chat_history, tool_ctx)
-        provider_name = "MongoDB Atlas Engine (Fallback)"
-
-    print(f"[CHATBOT] Response generated")
+        answer, tools_meta = fallback.generate_response(user_message, chat_history, from_iso, to_iso)
+        op_name = tools_meta[0]["tool"] if tools_meta else "mongodb_fallback_query"
+        records_cnt = sum(t.get("records_analyzed", 0) for t in tools_meta) if tools_meta else 0
+        exec_method = "AI Provider Unavailable / Fallback Mode (DeterministicMongoDBEngine)"
 
     return {
         "status": "success",
         "answer": answer,
         "data_source": "MongoDB Atlas Primary Database",
         "analysis_details": {
-            "operation": tool_ctx.get("tool", "mongodb_query"),
-            "sensors": tool_ctx.get("sensors", ["FORCE-01", "TEMP-01", "HUMIDITY-01"]),
+            "operation": op_name,
+            "sensors": [sensor_filter] if sensor_filter != "ALL" else ["FORCE-01", "TEMP-01", "HUMIDITY-01"],
             "time_range": time_label,
-            "records_analyzed": tool_ctx.get("records_analyzed", 0),
-            "execution_method": f"{provider_name} ({model_name})"
+            "records_analyzed": records_cnt,
+            "execution_method": exec_method
         }
     }
 
 if __name__ == "__main__":
     print("Testing chat_service.py...")
-    test_res = handle_chat_query({"message": "What is the latest force reading?"})
+    test_res = handle_chat_query({"message": "What is the current force?"})
     print("Test Response:", json.dumps(test_res, indent=2))

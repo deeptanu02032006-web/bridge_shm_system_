@@ -152,21 +152,38 @@ queue_lock = threading.Lock()
 last_disk_save_time = 0.0
 dirty_packet_count = 0
 
+CANONICAL_SENSORS = {
+    "FORCE-01": {"type": "force", "unit": "N"},
+    "TEMP-01": {"type": "temp", "unit": "°C"},
+    "HUMIDITY-01": {"type": "humidity", "unit": "%"}
+}
+
+LEGACY_TYPO_MAP = {
+    "FORC-01": "FORCE-01",
+    "FORCE01": "FORCE-01",
+    "FORCE-0": "FORCE-01",
+    "F0RCE-01": "FORCE-01",
+    "TEMP-0": "TEMP-01",
+    "TEMP01": "TEMP-01",
+    "HUIDITY-01": "HUMIDITY-01",
+    "HUMIITY-01": "HUMIDITY-01",
+    "HUMIDITY01": "HUMIDITY-01",
+    "HUMIDITY-0": "HUMIDITY-01",
+    "HUMITY-01": "HUMIDITY-01"
+}
+
 # ------------------------------------------------------------------------------
 # SENSOR METADATA INFERENCE HELPER
 # ------------------------------------------------------------------------------
 def infer_sensor_metadata(sensor_id: str) -> dict:
     """Maps physical sensor ID to category type and engineering unit."""
     s = sensor_id.upper()
-    if "FORCE" in s or "LOAD" in s or s.startswith("F-"):
-        return {"type": "force", "unit": "N"}
-    elif "TEMP" in s or "THERM" in s or s.startswith("T-"):
-        return {"type": "temp", "unit": "°C"}
-    elif "HUMID" in s or s.startswith("H-"):
-        return {"type": "humidity", "unit": "%"}
-    else:
-        prefix = s.split("-")[0].lower() if "-" in s else s.lower()
-        return {"type": prefix, "unit": "raw"}
+    if s in CANONICAL_SENSORS:
+        return CANONICAL_SENSORS[s]
+    mapped = LEGACY_TYPO_MAP.get(s)
+    if mapped and mapped in CANONICAL_SENSORS:
+        return CANONICAL_SENSORS[mapped]
+    return {"type": "force", "unit": "N"}
 
 # ==============================================================================
 # MONGODB ATLAS DATABASE MANAGER (PRIMARY DATABASE SOURCE OF TRUTH)
@@ -250,6 +267,20 @@ class MongoDBManager:
             devices_col = self.db["devices"]
             logs_col = self.db["ingestion_logs"]
             sync_col = self.db["sync_metadata"]
+
+            # Safely inspect existing indexes and drop obsolete non-session-aware unique indexes
+            try:
+                existing_indexes = list(telemetry_col.list_indexes())
+                for idx in existing_indexes:
+                    idx_name = idx.get("name")
+                    if idx_name == "_id_":
+                        continue
+                    key_dict = dict(idx.get("key", []))
+                    if idx.get("unique") and "session_id" not in key_dict:
+                        print(f"[MONGODB] Dropping obsolete non-session-aware unique index: {idx_name}")
+                        telemetry_col.drop_index(idx_name)
+            except Exception as ie:
+                print(f"[MONGODB] Obsolete index cleanup notice: {ie}")
 
             # Unique packet index
             telemetry_col.create_index(
@@ -590,7 +621,12 @@ def parse_arduino_line(line: str):
             except ValueError:
                 return None
         elif len(parts) == 3:
-            sensor_id = parts[0].strip().upper()
+            raw_id = parts[0].strip().upper()
+            sensor_id = LEGACY_TYPO_MAP.get(raw_id, raw_id)
+            if sensor_id not in CANONICAL_SENSORS:
+                print(f"[ARDUINO] [WARN] Rejected non-canonical sensor ID: '{raw_id}'")
+                continue
+
             raw_status = parts[1].strip().upper()
             raw_val = parts[2].strip()
 
@@ -720,7 +756,8 @@ def mongo_to_sheets_sync_worker():
                     max_seq = max(seqs) if seqs else None
                     seq_str = f"Seq {min(seqs)}..{max_seq}" if seqs else f"{len(unsynced_packets)} packets"
 
-                    print(f"[MONGODB SYNC] Starting 2-minute sync: {len(unsynced_packets)} packet(s) ({seq_str}) -> Google Sheets...")
+                    print(f"[MONGODB SYNC] 120-second synchronization started")
+                    print(f"[MONGODB SYNC] {len(unsynced_packets)} real MongoDB records selected ({seq_str})")
 
                     payload = {
                         "action": "sync_telemetry_batch",
@@ -746,13 +783,15 @@ def mongo_to_sheets_sync_worker():
                                 pruned = res_json.get("pruned", 0)
                                 retained = res_json.get("retainedRows", 0)
 
+                                print(f"[GOOGLE SHEETS] {count} records written in batch")
+
                                 if fetched_doc_ids:
                                     mongo_manager.mark_telemetry_synced_to_sheets(fetched_doc_ids)
 
                                 if max_seq is not None:
                                     mongo_manager.update_sync_state(max_seq, count, pruned, "SUCCESS")
 
-                                print(f"[MONGODB SYNC] 2-Minute Sync Complete: {count} packet(s) synced to Google Sheets. Pruned: {pruned}, Retained: {retained} rows ✓")
+                                print(f"[MONGODB SYNC] 120-Second Sync Complete: {count} packet(s) synced. Pruned: {pruned}, Retained: {retained} rows ✓")
                             else:
                                 print(f"[MONGODB SYNC] Google Sheets sync rejected payload: {res_json}")
                         except Exception as pe:

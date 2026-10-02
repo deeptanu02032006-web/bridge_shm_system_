@@ -9,6 +9,7 @@ Provides secure, read-only HTTP REST endpoints for MongoDB Atlas historical data
 - Hardware sequence gap analysis (/api/v1/telemetry/gaps)
 - Secondary cache synchronization status (/api/v1/sync/status)
 - Latest sensor reading snapshot (/api/v1/telemetry/latest)
+- AI Chatbot natural language querying (/api/v1/chat/query)
 
 Security & Safeguards:
 - Zero Credential Exposure: MONGODB_URI and QUERY_API_KEY remain strictly server-side.
@@ -60,7 +61,7 @@ MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "shm_bridge_db").strip()
 PORT = int(os.getenv("PORT") or os.getenv("QUERY_API_PORT") or "5000")
 API_KEY = os.getenv("QUERY_API_KEY", "SHM_SECURE_READ_KEY_2026").strip()
-BIND_HOST = os.getenv("QUERY_API_HOST", "0.0.0.0").strip()
+BIND_HOST = (os.getenv("BIND_HOST") or os.getenv("QUERY_API_HOST") or "0.0.0.0").strip()
 
 # PyMongo Dynamic Loading
 MongoClient = None
@@ -132,14 +133,16 @@ def parse_iso_or_ms(val) -> datetime:
         return None
 
 def infer_sensor_category(sensor_id: str) -> str:
-    s = sensor_id.upper()
+    if not sensor_id:
+        return "unknown"
+    s = str(sensor_id).strip().upper()
     if "FORCE" in s or "LOAD" in s or s.startswith("F-"):
         return "force"
     elif "TEMP" in s or "THERM" in s or s.startswith("T-"):
         return "temp"
     elif "HUMID" in s or s.startswith("H-"):
         return "humidity"
-    return "force"
+    return "unknown"
 
 def infer_sensor_unit(sensor_id: str) -> str:
     cat = infer_sensor_category(sensor_id)
@@ -169,13 +172,20 @@ class TelemetryQueryEngine:
             if not doc:
                 return {"status": "empty", "message": "No telemetry readings available in MongoDB Atlas"}
 
+            sensors_clean = {}
+            for s_id, s_info in doc.get("sensors", {}).items():
+                s_id_norm = str(s_id).strip().upper()
+                s_cat = infer_sensor_category(s_id_norm)
+                if s_cat != "unknown":
+                    sensors_clean[s_id_norm] = s_info
+
             return {
                 "status": "success",
                 "arduino_id": doc.get("arduino_id"),
                 "session_id": doc.get("session_id"),
                 "sequence": doc.get("sequence"),
                 "timestamp": doc.get("timestamp_ist") or doc.get("timestamp"),
-                "sensors": doc.get("sensors", {})
+                "sensors": sensors_clean
             }
         except Exception as e:
             return {"status": "error", "message": f"Query error: {e}"}
@@ -226,6 +236,9 @@ class TelemetryQueryEngine:
                 for s_id, s_info in sensors.items():
                     s_id_norm = str(s_id).strip().upper()
                     s_type = infer_sensor_category(s_id_norm)
+                    if s_type == "unknown":
+                        continue
+
                     s_unit = infer_sensor_unit(s_id_norm)
                     val = s_info.get("value")
                     status = s_info.get("status", "ONLINE")
@@ -287,6 +300,8 @@ class TelemetryQueryEngine:
                 sensors = doc.get("sensors", {})
                 for s_id, s_info in sensors.items():
                     s_id_norm = str(s_id).strip().upper()
+                    if infer_sensor_category(s_id_norm) == "unknown":
+                        continue
                     if sensor_id_filter and sensor_id_filter != "ALL" and s_id_norm != sensor_id_filter:
                         continue
                     val = s_info.get("value")
@@ -317,6 +332,51 @@ class TelemetryQueryEngine:
 
         except Exception as e:
             return {"status": "error", "message": f"Stats error: {e}"}
+
+    @staticmethod
+    def get_sensor_gaps(params: dict) -> dict:
+        """Analyzes recent sequence numbers to detect dropped packets / sequence gaps."""
+        db = get_db()
+        if db is None:
+            return {"status": "error", "message": "MongoDB Atlas database unavailable"}
+
+        try:
+            limit = min(max(10, int(params.get("limit", 200))), 1000)
+            telemetry_col = db["telemetry"]
+            cursor = list(telemetry_col.find({}, {"sequence": 1, "timestamp_ist": 1, "timestamp": 1})
+                          .sort("timestamp", DESCENDING).limit(limit))
+
+            if not cursor:
+                return {"status": "success", "total_checked": 0, "gaps_found": [], "missing_count": 0}
+
+            cursor.reverse()
+            sequences = [doc.get("sequence") for doc in cursor if doc.get("sequence") is not None]
+
+            gaps = []
+            missing_total = 0
+            for i in range(1, len(sequences)):
+                prev_seq = sequences[i - 1]
+                curr_seq = sequences[i]
+                if isinstance(prev_seq, int) and isinstance(curr_seq, int):
+                    diff = curr_seq - prev_seq
+                    if diff > 1:
+                        missing = diff - 1
+                        missing_total += missing
+                        gaps.append({
+                            "after_sequence": prev_seq,
+                            "before_sequence": curr_seq,
+                            "missing_packets": missing
+                        })
+
+            return {
+                "status": "success",
+                "total_checked": len(sequences),
+                "gaps_found": gaps,
+                "missing_count": missing_total,
+                "has_gaps": len(gaps) > 0
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Gap analysis error: {e}"}
 
     @staticmethod
     def get_sync_status(params: dict) -> dict:
@@ -360,6 +420,16 @@ class QueryAPIRequestHandler(BaseHTTPRequestHandler):
         self._send_cors_headers()
         self.end_headers()
 
+    def do_options(self):
+        return self.do_OPTIONS()
+
+    def do_get(self):
+        return self.do_GET()
+
+    def do_post(self):
+        return self.do_POST()
+
+
     def _validate_api_key(self) -> bool:
         if not API_KEY:
             return True
@@ -371,14 +441,18 @@ class QueryAPIRequestHandler(BaseHTTPRequestHandler):
         return key == API_KEY
 
     def do_GET(self):
-        if not self._validate_api_key():
-            self._respond_json({"status": "error", "message": "Unauthorized: Invalid API Key"}, 401)
-            return
-
         parsed = urlparse(self.path)
         path = parsed.path
         raw_params = parse_qs(parsed.query)
         params = {k: v[0] for k, v in raw_params.items() if v}
+
+        if path == "/health":
+            self._respond_json({"status": "healthy", "service": "SHM MongoDB Query API"})
+            return
+
+        if not self._validate_api_key():
+            self._respond_json({"status": "error", "message": "Unauthorized: Invalid API Key"}, 401)
+            return
 
         if path == "/api/v1/telemetry/latest":
             res = TelemetryQueryEngine.get_latest_telemetry(params)
@@ -396,11 +470,46 @@ class QueryAPIRequestHandler(BaseHTTPRequestHandler):
         elif path == "/api/v1/telemetry/stats":
             res = TelemetryQueryEngine.query_stats(params)
             self._respond_json(res)
+        elif path == "/api/v1/telemetry/gaps":
+            res = TelemetryQueryEngine.get_sensor_gaps(params)
+            self._respond_json(res)
         elif path == "/api/v1/sync/status":
             res = TelemetryQueryEngine.get_sync_status(params)
             self._respond_json(res)
-        elif path == "/health":
-            self._respond_json({"status": "healthy", "service": "SHM MongoDB Query API"})
+        else:
+            self._respond_json({"status": "error", "message": "Endpoint not found"}, 404)
+
+    def do_POST(self):
+        if not self._validate_api_key():
+            self._respond_json({"status": "error", "message": "Unauthorized: Invalid API Key"}, 401)
+            return
+
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/v1/chat/query":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body_bytes = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            try:
+                payload = json.loads(body_bytes.decode("utf-8"))
+            except Exception:
+                payload = {}
+
+            try:
+                import chat_service
+                res = chat_service.handle_chat_query(payload)
+                self._respond_json(res)
+            except Exception as e:
+                print(f"[CHATBOT ERROR] {e}")
+                self._respond_json({
+                    "status": "error",
+                    "answer": f"AI Chatbot service error: {e}",
+                    "data_source": "MongoDB Atlas Primary Database",
+                    "analysis_details": {
+                        "operation": "CHATBOT_ERROR",
+                        "execution_method": str(e)
+                    }
+                }, 500)
         else:
             self._respond_json({"status": "error", "message": "Endpoint not found"}, 404)
 

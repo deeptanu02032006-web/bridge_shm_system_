@@ -1966,7 +1966,7 @@ function fetchEventHistoryFromSheet(token) {
     }
 
     if (session.role !== "ADMIN") {
-      logEventToSheet(session.email, session.name, "Unauthorized Event History Access", "EventHistory", "Access denied (USER role attempted Event History fetch)");
+      logEventToSheet(session.email, session. name, "Unauthorized Event History Access", "EventHistory", "Access denied (USER role attempted Event History fetch)");
       return { status: "error", code: "FORBIDDEN", message: "Access denied. Administrator role required for Event History Audit Log." };
     }
 

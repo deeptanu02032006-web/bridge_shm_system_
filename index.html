@@ -7069,8 +7069,7 @@
                     let options = {
                         method: method,
                         headers: {
-                            'Content-Type': 'application/json',
-                            'X-API-KEY': 'm6IP-m-dfBmNikuCSVyFkWyJrmZisFzsJPd2cX6OyLc'
+                            'Content-Type': 'application/json'
                         }
                     };
                     if (method === 'POST' && body) {
@@ -12971,7 +12970,10 @@
                     `;
                 }
 
-                const formattedAnswer = escapeHtml(answer).replace(/\n/g, '<br/>');
+                let formattedAnswer = escapeHtml(answer)
+                    .replace(/\n/g, '<br/>')
+                    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                    .replace(/`([^`]+)`/g, '<code style="background:var(--surface-subtle); padding:2px 4px; border-radius:4px; font-family:var(--font-mono);">$1</code>');
 
                 msgDiv.innerHTML = `
                     <div style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.63rem; font-weight: 700; color: var(--text-muted); font-family: var(--font-mono); margin-left: 0.2rem;">

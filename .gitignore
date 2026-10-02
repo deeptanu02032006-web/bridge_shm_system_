@@ -5,7 +5,7 @@
 venv/
 # Local Disk Queue Backup & Temp files
 *.tmp
-pending_queue.json
+pending_queue.json.tmp 
 *.log
 # Python cache & build outputs
 __pycache__/
@@ -19,3 +19,4 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+pending_queue.json

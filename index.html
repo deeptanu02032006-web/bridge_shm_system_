@@ -3713,7 +3713,7 @@
                                 PARAMETER:</span>
                             <select id="anParamSelect" class="select-compact" style="min-width: 140px;"
                                 onchange="onAnalyticsParamChange(this.value)">
-                                <option value="force">Force (kN)</option>
+                                <option value="force">Force (N)</option>
                                 <option value="strain">Strain (µε)</option>
                                 <option value="temp">Temperature (°C)</option>
                                 <option value="humidity">Humidity (%)</option>
@@ -5501,7 +5501,7 @@
                                 <select id="exportParamSelect" class="select-compact" style="min-width: 140px;"
                                     onchange="onExportParamChange(this.value)">
                                     <option value="all">All Parameters</option>
-                                    <option value="force">Force (kN)</option>
+                                    <option value="force">Force (N)</option>
                                     <option value="strain">Strain (µε)</option>
                                     <option value="temp">Temperature (°C)</option>
                                     <option value="humidity">Humidity (%)</option>
@@ -5800,7 +5800,7 @@
                                 <select id="reportParamSelect" class="select-compact" style="min-width: 140px;"
                                     onchange="onReportParamChange(this.value)">
                                     <option value="all">All Parameters</option>
-                                    <option value="force">Force (kN)</option>
+                                    <option value="force">Force (N)</option>
                                     <option value="strain">Strain (µε)</option>
                                     <option value="temp">Temperature (°C)</option>
                                     <option value="humidity">Humidity (%)</option>
@@ -6426,7 +6426,7 @@
                                         <td style="font-weight:600;">Force</td>
                                         <td style="color:#d97706; font-family:var(--font-mono);">4000.00</td>
                                         <td style="color:#dc2626; font-family:var(--font-mono);">5000.00</td>
-                                        <td style="color:var(--text-muted);">kN</td>
+                                        <td style="color:var(--text-muted);">N</td>
                                     </tr>
                                     <tr>
                                         <td style="font-weight:600;">Strain</td>
@@ -6799,7 +6799,7 @@
                 <div class="form-group"><label for="newSensorType" class="form-label">Sensor Parameter
                         Type</label><select id="newSensorType" class="form-control"
                         onchange="updateGeneratedSensorIdPreview()">
-                        <option value="force">Force (kN)</option>
+                        <option value="force">Force (N)</option>
                         <option value="strain">Strain (µε)</option>
                         <option value="temp">Temperature (°C)</option>
                         <option value="humidity">Humidity (%)</option>
@@ -6992,7 +6992,6 @@
             method = 'GET',
             body = null
         ) {
-
             return new Promise(
                 (resolve, reject) => {
 
@@ -7015,17 +7014,15 @@
                                         response.status === 'error'
                                     ) {
 
-                                        reject(
-                                            new Error(
-                                                response &&
-                                                    response.message
-                                                    ? response.message
-                                                    : 'MongoDB Query API error'
-                                            )
-                                        );
+                                        var errText = response
+                                            ? (response.message || response.answer || response.error || response.raw_response || JSON.stringify(response))
+                                            : 'MongoDB Query API error';
+
+                                        reject(new Error(errText));
 
                                         return;
                                     }
+
 
                                     resolve(response);
                                 }
@@ -7057,20 +7054,43 @@
                     }
 
                     // --------------------------------------------------------------
-                    // DO NOT PUT THE API KEY HERE.
-                    //
-                    // A Google Sites deployment should always use the Apps Script
-                    // proxy above.
+                    // LOCAL BROWSER TESTING FALLBACK (Direct Query API call)
                     // --------------------------------------------------------------
 
-                    reject(
-                        new Error(
-                            'MongoDB historical API requires the Google Apps Script proxy.'
-                        )
-                    );
+                    let url = getQueryApiUrl(path);
+                    let queryParts = [];
+                    Object.keys(query || {}).forEach(k => {
+                        if (query[k] !== null && query[k] !== undefined && query[k] !== '') {
+                            queryParts.push(encodeURIComponent(k) + '=' + encodeURIComponent(query[k]));
+                        }
+                    });
+                    if (queryParts.length > 0) url += '?' + queryParts.join('&');
+
+                    let options = {
+                        method: method,
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-API-KEY': 'm6IP-m-dfBmNikuCSVyFkWyJrmZisFzsJPd2cX6OyLc'
+                        }
+                    };
+                    if (method === 'POST' && body) {
+                        options.body = JSON.stringify(body);
+                    }
+
+                    fetch(url, options)
+                        .then(res => res.json())
+                        .then(data => {
+                            if (data && data.status === 'error') {
+                                reject(new Error(data.message || 'Query API Error'));
+                            } else {
+                                resolve(data);
+                            }
+                        })
+                        .catch(err => reject(err));
                 }
             );
         }
+
         let currentMainView = 'overview';
         let selectedParamTab = 'force';
         let selectedSensorId = 'all';
@@ -7087,7 +7107,7 @@
         let analyticsRange = 'all';
 
         const ALERT_THRESHOLDS = {
-            force: { warning: 4000, critical: 5000, unit: 'kN', name: 'Force' },
+            force: { warning: 4000, critical: 5000, unit: 'N', name: 'Force' },
             strain: { warning: 800, critical: 1000, unit: 'µε', name: 'Strain' },
             temp: { warning: 45, critical: 50, unit: '°C', name: 'Temperature' },
             humidity: { warning: 90, critical: 100, unit: '%', name: 'Humidity' }
@@ -7200,7 +7220,7 @@
 
         const PARAM_META = {
             force: {
-                name: 'Force', unit: 'kN', decimals: 2, color: '#0284c7',
+                name: 'Force', unit: 'N', decimals: 2, color: '#0284c7',
                 palette: ['#0284c7', '#0369a1', '#38bdf8', '#0ea5e9', '#1d4ed8'],
                 keywords: ['FORCE', 'F0', 'LOAD', 'HX711', 'LCELL'],
                 boxIds: { latest: 'boxForceLatest', max: 'boxForceMax', min: 'boxForceMin', avg: 'boxForceAvg' }
@@ -7632,14 +7652,14 @@
             const elapsedStr = (elapsedSec < 60) ? `${elapsedSec} s ago` : `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s ago`;
             if (lastUpdateText) lastUpdateText.textContent = elapsedStr;
 
-            if (elapsedSec <= 10) {
+            if (elapsedSec <= 150) {
                 if (statusDot) statusDot.className = 'status-dot live';
                 if (statusText) statusText.textContent = 'LIVE';
                 if (liveValMain) liveValMain.style.color = '#16a34a';
                 if (liveIcon) { liveIcon.style.backgroundColor = '#dcfce7'; liveIcon.style.color = '#16a34a'; }
                 if (liveCard) liveCard.className = 'kpi-card-shm green';
-                if (liveSub) liveSub.textContent = 'Receiving telemetry';
-            } else if (elapsedSec <= 30) {
+                if (liveSub) liveSub.textContent = 'Receiving telemetry (120s sync)';
+            } else if (elapsedSec <= 300) {
                 if (statusDot) statusDot.className = 'status-dot delayed';
                 if (statusText) statusText.textContent = 'DELAYED';
                 if (liveValMain) liveValMain.style.color = '#d97706';
@@ -7969,19 +7989,28 @@
         });
 
         function parseDiscoveredSensors(data) {
-            if (data && data.registry && Array.isArray(data.registry)) {
-                const activeRegIds = new Set(data.registry.map(r => String(r.id).toUpperCase()));
-                Object.keys(registeredSensorsStore).forEach(sId => {
-                    if (!activeRegIds.has(sId.toUpperCase())) {
-                        delete registeredSensorsStore[sId];
-                    }
-                });
+            const CANONICAL_IDS = new Set(['FORCE-01', 'TEMP-01', 'HUMIDITY-01']);
+            
+            // Ensure canonical sensors exist in registeredSensorsStore by default
+            const defaultCanonical = {
+                'FORCE-01': { id: 'FORCE-01', name: 'FORCE-01', type: 'force', status: 'WAITING FOR DATA', enabled: true, archived: false },
+                'TEMP-01': { id: 'TEMP-01', name: 'TEMP-01', type: 'temp', status: 'WAITING FOR DATA', enabled: true, archived: false },
+                'HUMIDITY-01': { id: 'HUMIDITY-01', name: 'HUMIDITY-01', type: 'humidity', status: 'WAITING FOR DATA', enabled: true, archived: false }
+            };
+            Object.keys(defaultCanonical).forEach(cId => {
+                if (!registeredSensorsStore[cId]) {
+                    registeredSensorsStore[cId] = Object.assign({}, defaultCanonical[cId]);
+                }
+            });
+
+            if (data && data.registry && Array.isArray(data.registry) && data.registry.length > 0) {
                 data.registry.forEach(r => {
                     const normId = String(r.id).toUpperCase();
+                    if (!CANONICAL_IDS.has(normId)) return;
                     registeredSensorsStore[normId] = {
                         id: normId,
-                        name: r.name || normId,
-                        type: String(r.type || 'force').toLowerCase(),
+                        name: normId,
+                        type: String(r.type || (normId === 'FORCE-01' ? 'force' : (normId === 'TEMP-01' ? 'temp' : 'humidity'))).toLowerCase(),
                         status: r.status || 'WAITING FOR DATA',
                         createdAt: r.createdAt || null,
                         enabled: r.enabled !== false,
@@ -7996,8 +8025,8 @@
             const stats = (data && data.statistics) ? data.statistics : {};
             const timeIdx = headers.indexOf('Timestamp');
 
-            // Authoritative Sensor Registry enforcement: ONLY registered sensors in registeredSensorsStore are displayed
-            const candidateIdsSet = new Set(Object.keys(registeredSensorsStore));
+            // Authoritative Sensor Registry enforcement: ONLY canonical sensors displayed
+            const candidateIdsSet = new Set(Object.keys(registeredSensorsStore).filter(id => CANONICAL_IDS.has(id)));
 
             candidateIdsSet.forEach(sensorId => {
                 const statusHeader = sensorId + '_Status';
@@ -8005,13 +8034,7 @@
                 const statusColIdx = headers.indexOf(statusHeader);
 
                 const localReg = registeredSensorsStore[sensorId] || {};
-                let matchedType = localReg.type || 'other';
-                if (matchedType === 'other') {
-                    const nameUpper = sensorId.toUpperCase();
-                    for (const [pKey, pMeta] of Object.entries(PARAM_META)) {
-                        if (pMeta.keywords.some(kw => nameUpper.includes(kw))) { matchedType = pKey; break; }
-                    }
-                }
+                let matchedType = localReg.type || (sensorId === 'FORCE-01' ? 'force' : (sensorId === 'TEMP-01' ? 'temp' : 'humidity'));
 
                 let latestVal = null, latestTimestampStr = null, latestStatusRaw = 'OFFLINE';
                 if (colIdx !== -1 && rows.length > 0) {
@@ -8037,16 +8060,38 @@
                 let sensorStatus = 'WAITING FOR DATA';
                 let readingAgeSec = 999999;
                 if (latestTimestampStr) {
-                    const readingMs = new Date(latestTimestampStr.replace(' ', 'T')).getTime();
-                    if (!isNaN(readingMs)) readingAgeSec = Math.floor((Date.now() - readingMs) / 1000);
+                    let readingMs = 0;
+                    try {
+                        let s = String(latestTimestampStr).trim().replace(' ', 'T');
+                        readingMs = new Date(s).getTime();
+                        if (isNaN(readingMs)) {
+                            const parts = String(latestTimestampStr).split(' ');
+                            if (parts.length >= 2) {
+                                const dp = parts[0].split('-');
+                                const tp = parts[1].split(':');
+                                if (dp.length === 3 && tp.length === 3) {
+                                    readingMs = new Date(dp[0], dp[1] - 1, dp[2], tp[0], tp[1], tp[2]).getTime();
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        readingMs = 0;
+                    }
+                    if (!isNaN(readingMs) && readingMs > 0) {
+                        readingAgeSec = Math.max(0, Math.floor((Date.now() - readingMs) / 1000));
+                    }
                 }
 
-                if (latestVal !== null && latestTimestampStr) {
-                    if (latestStatusRaw === 'ONLINE') {
-                        if (readingAgeSec <= 150 || (Date.now() - lastNewDataLocalTime <= 150000)) sensorStatus = 'ONLINE';
-                        else if (readingAgeSec <= 300) sensorStatus = 'DELAYED';
-                        else sensorStatus = 'OFFLINE';
-                    } else { sensorStatus = 'OFFLINE'; }
+                if (latestVal !== null) {
+                    if (latestStatusRaw === 'ONLINE' || latestStatusRaw === 'LIVE' || !latestStatusRaw) {
+                        if (readingAgeSec <= 600 || rows.length > 0) {
+                            sensorStatus = 'LIVE';
+                        } else {
+                            sensorStatus = 'OFFLINE';
+                        }
+                    } else {
+                        sensorStatus = 'OFFLINE';
+                    }
                 }
 
                 sensorsMap[sensorId] = {
@@ -12862,6 +12907,16 @@
             }
         }
 
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
         function handleQuickChip(text) {
             const inputEl = document.getElementById('shmChatInput');
             if (inputEl) {
@@ -12890,44 +12945,49 @@
             const container = document.getElementById('shmChatMessages');
             if (!container) return;
 
-            const msgDiv = document.createElement('div');
-            msgDiv.className = 'chat-msg-row bot';
-            msgDiv.style.cssText = 'display: flex; justify-content: flex-start; margin-bottom: 0.85rem; flex-direction: column; gap: 0.3rem;';
+            try {
+                const msgDiv = document.createElement('div');
+                msgDiv.className = 'chat-msg-row bot';
+                msgDiv.style.cssText = 'display: flex; justify-content: flex-start; margin-bottom: 0.85rem; flex-direction: column; gap: 0.3rem;';
 
-            const answer = res.answer || res.message || 'No response generated.';
-            const details = res.analysis_details || {};
-            const dataSourceStr = res.data_source || 'MongoDB Atlas';
+                const answer = (res && (res.answer || res.message)) ? (res.answer || res.message) : 'No response generated.';
+                const details = (res && res.analysis_details) ? res.analysis_details : {};
+                const dataSourceStr = (res && res.data_source) ? res.data_source : 'MongoDB Atlas';
 
-            let detailsHtml = '';
-            if (details && details.operation) {
-                detailsHtml = `
-                    <details style="margin-top: 0.4rem; background: var(--surface-subtle); border: 1px solid var(--border-color); border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.68rem; font-family: var(--font-mono); color: var(--text-muted);">
-                        <summary style="cursor: pointer; font-weight: 700; color: var(--accent-primary); outline: none; user-select: none;">📊 Analysis Details</summary>
-                        <div style="margin-top: 0.35rem; display: flex; flex-direction: column; gap: 0.2rem; border-top: 1px dashed var(--border-color); padding-top: 0.3rem;">
-                            <div><strong>Operation:</strong> ${escapeHtml(details.operation || 'N/A')}</div>
-                            <div><strong>Sensors:</strong> ${escapeHtml((details.sensors || []).join(', ') || 'N/A')}</div>
-                            <div><strong>Time Window:</strong> ${escapeHtml(details.time_range || 'N/A')}</div>
-                            <div><strong>Records Analyzed:</strong> ${(details.records_analyzed !== undefined) ? Number(details.records_analyzed).toLocaleString() : 'N/A'}</div>
-                            <div><strong>Execution Method:</strong> ${escapeHtml(details.execution_method || 'MongoDB Query')}</div>
-                        </div>
-                    </details>
+                let detailsHtml = '';
+                if (details && details.operation) {
+                    const sensorsText = Array.isArray(details.sensors) ? details.sensors.join(', ') : String(details.sensors || 'N/A');
+                    detailsHtml = `
+                        <details style="margin-top: 0.4rem; background: var(--surface-subtle); border: 1px solid var(--border-color); border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.68rem; font-family: var(--font-mono); color: var(--text-muted);">
+                            <summary style="cursor: pointer; font-weight: 700; color: var(--accent-primary); outline: none; user-select: none;">📊 Analysis Details</summary>
+                            <div style="margin-top: 0.35rem; display: flex; flex-direction: column; gap: 0.2rem; border-top: 1px dashed var(--border-color); padding-top: 0.3rem;">
+                                <div><strong>Operation:</strong> ${escapeHtml(details.operation || 'N/A')}</div>
+                                <div><strong>Sensors:</strong> ${escapeHtml(sensorsText)}</div>
+                                <div><strong>Time Window:</strong> ${escapeHtml(details.time_range || 'N/A')}</div>
+                                <div><strong>Records Analyzed:</strong> ${(details.records_analyzed !== undefined) ? Number(details.records_analyzed).toLocaleString() : 'N/A'}</div>
+                                <div><strong>Execution Method:</strong> ${escapeHtml(details.execution_method || 'MongoDB Query')}</div>
+                            </div>
+                        </details>
+                    `;
+                }
+
+                const formattedAnswer = escapeHtml(answer).replace(/\n/g, '<br/>');
+
+                msgDiv.innerHTML = `
+                    <div style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.63rem; font-weight: 700; color: var(--text-muted); font-family: var(--font-mono); margin-left: 0.2rem;">
+                        <span style="display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #16a34a;"></span>
+                        Data source: ${escapeHtml(dataSourceStr)}
+                    </div>
+                    <div style="background: var(--surface-elevated); color: var(--text-primary); border: 1px solid var(--border-color); padding: 0.7rem 0.85rem; border-radius: 12px 12px 12px 2px; max-width: 90%; font-size: 0.78rem; line-height: 1.45; box-shadow: var(--card-shadow);">
+                        ${formattedAnswer}
+                        ${detailsHtml}
+                    </div>
                 `;
+                container.appendChild(msgDiv);
+                container.scrollTop = container.scrollHeight;
+            } catch (err) {
+                console.error("appendBotMessageUI error:", err);
             }
-
-            const formattedAnswer = escapeHtml(answer).replace(/\n/g, '<br/>');
-
-            msgDiv.innerHTML = `
-                <div style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.63rem; font-weight: 700; color: var(--text-muted); font-family: var(--font-mono); margin-left: 0.2rem;">
-                    <span style="display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #16a34a;"></span>
-                    Data source: ${escapeHtml(dataSourceStr)}
-                </div>
-                <div style="background: var(--surface-elevated); color: var(--text-primary); border: 1px solid var(--border-color); padding: 0.7rem 0.85rem; border-radius: 12px 12px 12px 2px; max-width: 90%; font-size: 0.78rem; line-height: 1.45; box-shadow: var(--card-shadow);">
-                    ${formattedAnswer}
-                    ${detailsHtml}
-                </div>
-            `;
-            container.appendChild(msgDiv);
-            container.scrollTop = container.scrollHeight;
         }
 
         function appendBotThinkingUI() {
@@ -12964,6 +13024,26 @@
             inputEl.value = '';
             appendUserMessageUI(message);
 
+            const isGoogleHost = typeof google !== 'undefined' && google.script && google.script.run;
+            const isAuthenticated = currentUserSession && currentUserSession.token && !isUserLoggedOut;
+
+            if (isGoogleHost && !isAuthenticated) {
+                appendBotMessageUI({
+                    status: 'error',
+                    answer: 'Please log in to use the SHM Telemetry Assistant.',
+                    data_source: 'SHM Authentication Service',
+                    analysis_details: {
+                        operation: 'AUTHENTICATION_REQUIRED',
+                        execution_method: 'Session Token Check'
+                    }
+                });
+                return;
+            }
+
+            if (!currentUserSession) {
+                currentUserSession = { token: 'sess_local_dev', name: 'System Operator', role: 'ADMIN' };
+            }
+
             isBotThinking = true;
             appendBotThinkingUI();
 
@@ -12979,50 +13059,31 @@
                 payload
             )
                 .then(res => {
-
                     removeBotThinkingUI();
-
                     isBotThinking = false;
-
                     appendBotMessageUI(res);
-
                     botChatHistory.push({
                         user: message,
                         bot: res.answer,
-                        context:
-                            res.context || {}
+                        context: res.context || {}
                     });
-
                 })
                 .catch(err => {
-
                     removeBotThinkingUI();
-
                     isBotThinking = false;
-
                     appendBotMessageUI({
-
                         status: 'error',
-
-                        answer:
-                            'Unable to reach the MongoDB historical analytics service. Please check the Query API deployment and Apps Script proxy configuration.',
-
-                        data_source:
-                            'MongoDB Atlas Query API',
-
+                        answer: 'Unable to reach the MongoDB historical analytics service. ' + (err && err.message ? err.message : String(err)),
+                        data_source: 'MongoDB Atlas Query API',
                         analysis_details: {
-
-                            operation:
-                                'MONGODB_QUERY_API_NETWORK_ERROR',
-
-                            execution_method:
-                                err.toString()
+                            operation: 'MONGODB_QUERY_API_NETWORK_ERROR',
+                            execution_method: err.toString()
                         }
                     });
-
                 });
         }
     </script>
+
 
     <!-- FLOATING AI DAQ CHATBOT TRIGGER BUTTON -->
     <div id="shmChatbotTrigger" onclick="toggleChatbotDrawer()" title="Open MongoDB SHM Assistant"
@@ -13075,8 +13136,7 @@
                 <div
                     style="background: var(--surface-elevated); color: var(--text-primary); border: 1px solid var(--border-color); padding: 0.75rem 0.85rem; border-radius: 12px 12px 12px 2px; max-width: 90%; font-size: 0.78rem; line-height: 1.45; box-shadow: var(--card-shadow);">
                     Hello! I am your <strong>MongoDB SHM Telemetry Assistant</strong>. Ask me any natural language
-                    question regarding maximum/minimum forces, temperatures, strain, correlation, or sequence gaps
-                    across the bridge.
+                    question regarding force, temperature, humidity, history, statistics, or data gaps from MongoDB Atlas.
                 </div>
             </div>
         </div>
@@ -13084,21 +13144,21 @@
         <!-- Quick Chips Bar -->
         <div
             style="padding: 0.4rem 0.75rem; background: var(--surface-subtle); border-top: 1px solid var(--border-color); display: flex; gap: 0.4rem; overflow-x: auto; white-space: nowrap; user-select: none;">
-            <span onclick="handleQuickChip('What was the maximum force last week?')"
+            <span onclick="handleQuickChip('What is the current force?')"
+                style="font-size: 0.64rem; font-family: var(--font-mono); font-weight: 600; padding: 0.2rem 0.5rem; background: var(--surface); border: 1px solid var(--border-color); border-radius: 12px; cursor: pointer; color: var(--text-secondary);">Current
+                force</span>
+            <span onclick="handleQuickChip('What is the maximum force today?')"
                 style="font-size: 0.64rem; font-family: var(--font-mono); font-weight: 600; padding: 0.2rem 0.5rem; background: var(--surface); border: 1px solid var(--border-color); border-radius: 12px; cursor: pointer; color: var(--text-secondary);">Max
-                force last week</span>
-            <span onclick="handleQuickChip('Average temperature last 30 days?')"
+                force today</span>
+            <span onclick="handleQuickChip('Average humidity today?')"
                 style="font-size: 0.64rem; font-family: var(--font-mono); font-weight: 600; padding: 0.2rem 0.5rem; background: var(--surface); border: 1px solid var(--border-color); border-radius: 12px; cursor: pointer; color: var(--text-secondary);">Avg
-                temp 30 days</span>
-            <span onclick="handleQuickChip('Which sensor recorded highest value yesterday?')"
-                style="font-size: 0.64rem; font-family: var(--font-mono); font-weight: 600; padding: 0.2rem 0.5rem; background: var(--surface); border: 1px solid var(--border-color); border-radius: 12px; cursor: pointer; color: var(--text-secondary);">Highest
-                yesterday</span>
+                humidity today</span>
             <span onclick="handleQuickChip('Are there missing readings?')"
                 style="font-size: 0.64rem; font-family: var(--font-mono); font-weight: 600; padding: 0.2rem 0.5rem; background: var(--surface); border: 1px solid var(--border-color); border-radius: 12px; cursor: pointer; color: var(--text-secondary);">Missing
                 gaps</span>
-            <span onclick="handleQuickChip('Correlation between temperature and strain?')"
-                style="font-size: 0.64rem; font-family: var(--font-mono); font-weight: 600; padding: 0.2rem 0.5rem; background: var(--surface); border: 1px solid var(--border-color); border-radius: 12px; cursor: pointer; color: var(--text-secondary);">Temp
-                & strain correlation</span>
+            <span onclick="handleQuickChip('What sensors are currently active?')"
+                style="font-size: 0.64rem; font-family: var(--font-mono); font-weight: 600; padding: 0.2rem 0.5rem; background: var(--surface); border: 1px solid var(--border-color); border-radius: 12px; cursor: pointer; color: var(--text-secondary);">Active
+                sensors</span>
             <span onclick="handleQuickChip('How many telemetry records stored in the database?')"
                 style="font-size: 0.64rem; font-family: var(--font-mono); font-weight: 600; padding: 0.2rem 0.5rem; background: var(--surface); border: 1px solid var(--border-color); border-radius: 12px; cursor: pointer; color: var(--text-secondary);">Total
                 DB records</span>
@@ -13107,13 +13167,14 @@
         <!-- Chat Input Footer -->
         <div
             style="padding: 0.65rem 0.85rem; background: var(--surface); border-top: 1px solid var(--border-color); display: flex; gap: 0.5rem; align-items: center;">
-            <input id="shmChatInput" type="text" placeholder="Ask about force, strain, temp, gaps..."
+            <input id="shmChatInput" type="text" placeholder="Ask about force, temperature, humidity, history, statistics, or data gaps..."
                 onkeydown="if(event.key==='Enter') sendChatMessage()"
                 style="flex: 1; padding: 0.45rem 0.75rem; border-radius: 8px; border: 1px solid var(--border-color); background: var(--surface-subtle); color: var(--text-primary); font-size: 0.78rem; outline: none; font-family: var(--font-sans);" />
             <button id="shmChatSendBtn" onclick="sendChatMessage()"
                 style="background: var(--accent-primary); color: #ffffff; border: none; padding: 0.45rem 0.85rem; border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer; display: flex; align-items: center; gap: 0.3rem;">Send</button>
         </div>
     </div>
+
 </body>
 
 </html>

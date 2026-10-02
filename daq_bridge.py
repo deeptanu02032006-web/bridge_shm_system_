@@ -268,33 +268,25 @@ class MongoDBManager:
             logs_col = self.db["ingestion_logs"]
             sync_col = self.db["sync_metadata"]
 
-            # Safely inspect existing indexes and drop obsolete non-session-aware unique indexes
+            # Safely drop obsolete unique indexes if present
             try:
                 existing_indexes = list(telemetry_col.list_indexes())
                 for idx in existing_indexes:
                     idx_name = idx.get("name")
                     if idx_name == "_id_":
                         continue
-                    key_dict = dict(idx.get("key", []))
-                    if idx.get("unique") and "session_id" not in key_dict:
-                        print(f"[MONGODB] Dropping obsolete non-session-aware unique index: {idx_name}")
+                    if idx.get("unique"):
+                        print(f"[MONGODB] Dropping unique constraint index to allow continuous ingestion: {idx_name}")
                         telemetry_col.drop_index(idx_name)
             except Exception as ie:
-                print(f"[MONGODB] Obsolete index cleanup notice: {ie}")
-
-            # Unique packet index
-            telemetry_col.create_index(
-                [("arduino_id", ASCENDING), ("session_id", ASCENDING), ("sequence", ASCENDING)],
-                unique=True,
-                name="uniq_packet_key"
-            )
+                print(f"[MONGODB] Index cleanup notice: {ie}")
 
             # Query performance indexes
             telemetry_col.create_indexes([
                 IndexModel([("timestamp", DESCENDING)], name="idx_timestamp_desc"),
                 IndexModel([("arduino_id", ASCENDING), ("timestamp", DESCENDING)], name="idx_arduino_time"),
                 IndexModel([("synced_to_sheets", ASCENDING), ("ingested_at", ASCENDING)], name="idx_sync_ingest"),
-                IndexModel([("arduino_id", ASCENDING), ("session_id", ASCENDING), ("synced_to_sheets", ASCENDING), ("sequence", ASCENDING)], name="idx_session_sync_seq"),
+                IndexModel([("arduino_id", ASCENDING), ("sequence", ASCENDING)], name="idx_ard_seq"),
                 IndexModel([("sequence", ASCENDING)], name="idx_sequence")
             ])
 
@@ -319,7 +311,7 @@ class MongoDBManager:
             return False, 0, 0
 
         try:
-            telemetry_requests = []
+            telemetry_docs = []
             sensor_updates = {}
             now_dt = datetime.now(timezone.utc)
             seq_numbers = []
@@ -342,7 +334,7 @@ class MongoDBManager:
                 except ValueError:
                     ts_dt = now_dt
 
-                doc_id = f"{arduino_id}_{session_id}_{sequence}"
+                doc_id = f"{arduino_id}_{session_id}_{sequence}_{uuid.uuid4().hex[:8]}"
                 sensors = pkt.get("sensors", {})
 
                 doc = {
@@ -356,10 +348,7 @@ class MongoDBManager:
                     "ingested_at": now_dt,
                     "synced_to_sheets": False
                 }
-
-                telemetry_requests.append(
-                    UpdateOne({"_id": doc_id}, {"$setOnInsert": doc}, upsert=True)
-                )
+                telemetry_docs.append(doc)
 
                 for sensor_id, info in sensors.items():
                     sensor_id_norm = str(sensor_id).strip().upper()
@@ -373,14 +362,12 @@ class MongoDBManager:
                         "last_seen_at": ts_dt
                     }
 
-            if not telemetry_requests:
+            if not telemetry_docs:
                 return True, 0, 0
 
             telemetry_col = self.db["telemetry"]
-            result = telemetry_col.bulk_write(telemetry_requests, ordered=False)
-
-            inserted_cnt = result.upserted_count
-            duplicate_cnt = len(telemetry_requests) - inserted_cnt
+            result = telemetry_col.insert_many(telemetry_docs, ordered=False)
+            inserted_cnt = len(result.inserted_ids)
 
             # Update sensors metadata collection
             sensors_col = self.db["sensors"]
@@ -425,8 +412,8 @@ class MongoDBManager:
             )
 
             seq_str = f"Seq {min(seq_numbers)}..{max(seq_numbers)}" if seq_numbers else f"{len(batch_packets)} packets"
-            print(f"[MONGODB] Primary Ingest: {inserted_cnt} new packet(s), {duplicate_cnt} duplicate(s) prevented ({seq_str}) ✓")
-            return True, inserted_cnt, duplicate_cnt
+            print(f"[MONGODB] Primary Ingest: {inserted_cnt} packet(s) stored ({seq_str}) ✓")
+            return True, inserted_cnt, 0
 
         except PyMongoError as pe:
             print(f"[MONGODB] Database insertion failed: {pe}")

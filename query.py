@@ -2,7 +2,7 @@
 """
 query.py — Optional Secondary Backend Entry Point for MongoDB Atlas Query API
 ==============================================================================
-Provides a direct execution interface for the Read-Only MongoDB Query Layer.
+Provides direct execution interface for the Read-Only MongoDB Query Layer.
 Usage:
     python query.py
 """

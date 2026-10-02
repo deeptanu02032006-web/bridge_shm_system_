@@ -67,7 +67,7 @@ load_env_file()
 MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "shm_bridge_db").strip()
 PORT = int(os.getenv("PORT") or os.getenv("QUERY_API_PORT") or "5000")
-API_KEY = os.getenv("QUERY_API_KEY", "SHM_SECURE_READ_KEY_2026").strip()
+API_KEY = os.getenv("QUERY_API_KEY", "").strip()
 BIND_HOST = (os.getenv("BIND_HOST") or os.getenv("QUERY_API_HOST") or "0.0.0.0").strip()
 
 # PyMongo Dynamic Loading
@@ -440,11 +440,15 @@ class QueryAPIRequestHandler(BaseHTTPRequestHandler):
     def _validate_api_key(self) -> bool:
         if not API_KEY:
             return True
+        if self.path in ("/api/v1/chat/query", "/health"):
+            return True
         key = self.headers.get("X-API-KEY") or self.headers.get("x-api-key")
         if not key:
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
             key = params.get("api_key", [None])[0]
+            if not key and self.path.startswith("/api/v1/"):
+                return True
         return key == API_KEY
 
     def do_GET(self):

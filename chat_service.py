@@ -419,11 +419,274 @@ OPENAI_TOOLS_SCHEMA = [
 ]
 
 # ------------------------------------------------------------------------------
+# EXPLICIT INTENT ROUTING LAYER (CONVERSATIONAL, TELEMETRY, GENERAL ENGINEERING)
+# ------------------------------------------------------------------------------
+INTENT_CONVERSATIONAL = "CONVERSATIONAL_INTENT"
+INTENT_TELEMETRY = "TELEMETRY_INTENT"
+INTENT_GENERAL_ENGINEERING = "GENERAL_ENGINEERING_INTENT"
+
+def classify_intent(query_text: str) -> str:
+    """
+    Classifies natural language user queries into explicit operational intents:
+    1. CONVERSATIONAL_INTENT — Greetings, thanks, farewells, help, capabilities (0 MongoDB queries)
+    2. TELEMETRY_INTENT — Live/historical bridge sensor data, stats, gaps, record counts
+    3. GENERAL_ENGINEERING_INTENT — Conceptual engineering/physics/software questions
+    """
+    if not query_text:
+        return INTENT_CONVERSATIONAL
+
+    q_clean = query_text.strip()
+    q_lower = q_clean.lower()
+    q_norm = re.sub(r'[^\w\s]', '', q_lower).strip()
+    words = q_norm.split()
+
+    # 1. TELEMETRY_INTENT — Explicit telemetry indicators
+    telemetry_phrases = [
+        "current force", "current temperature", "current humidity", "current temp",
+        "latest force", "latest temperature", "latest humidity", "latest temp",
+        "latest reading", "latest readings", "latest sensor data", "latest telemetry", "latest snapshot",
+        "today's force", "today's temperature", "today's humidity", "todays force", "todays temp",
+        "maximum force", "minimum force", "max force", "min force", "max temp", "min temp",
+        "average force", "average temperature", "average humidity", "avg force", "avg temp",
+        "statistics", "stddev", "statistic", "stats",
+        "historical readings", "history", "records", "record count", "total records", "stored records",
+        "how many records", "how many readings", "how many data points",
+        "packet gaps", "missing packets", "dropped packets", "sequence gaps", "packet loss in mongodb",
+        "active sensors", "available sensors", "what sensors are active", "which sensors are active",
+        "sensor readings", "show data", "export telemetry", "show history", "list records", "data logs",
+        "continuity check", "last 2 hours", "last 24 hours", "past 24 hours", "past 7 days", "past month"
+    ]
+
+    for tp in telemetry_phrases:
+        if tp in q_lower or tp in q_norm:
+            return INTENT_TELEMETRY
+
+    # Hardware IDs or aliases combined with telemetry query indicators
+    hardware_ids = ["force-01", "temp-01", "humidity-01", "f-01", "t-01", "h-01", "uno-01"]
+    has_hw = any(h in q_lower for h in hardware_ids)
+    has_telemetry_verb = any(v in q_lower for v in [
+        "current", "latest", "now", "value", "reading", "readings", "stat", "stats",
+        "history", "historical", "max", "min", "avg", "average", "count", "gap", "gaps",
+        "record", "records", "show", "get", "fetch", "query"
+    ])
+    if has_hw and has_telemetry_verb:
+        return INTENT_TELEMETRY
+
+    # Queries asking for current values of specific sensors e.g. "what is the current force"
+    if any(k in q_lower for k in ["current", "latest", "now", "realtime", "real-time"]):
+        if any(s in q_lower for s in ["force", "temperature", "temp", "humidity", "reading", "readings", "value", "data"]):
+            return INTENT_TELEMETRY
+
+    # Statistical metrics applied to telemetry data
+    if "standard deviation" in q_lower and any(s in q_lower for s in ["force", "temp", "temperature", "humidity", "reading", "data"]):
+        return INTENT_TELEMETRY
+
+    # Packet gap inquiry
+    if any(k in q_lower for k in ["packet gap", "packet gaps", "dropped packet", "missing packet", "dropped packets", "missing packets"]):
+        return INTENT_TELEMETRY
+
+    # Imperative data query prefixes
+    if any(q_norm.startswith(prefix) for prefix in ["show ", "get ", "fetch ", "query ", "display "]):
+        if any(s in q_norm for s in ["force", "temp", "temperature", "humidity", "reading", "readings", "history", "stats", "records", "data"]):
+            return INTENT_TELEMETRY
+
+    # 2. CONVERSATIONAL_INTENT — Pure conversational messages
+    conversational_exact = {
+        "hi", "hello", "hey", "heya", "howdy", "greetings", "hola",
+        "good morning", "good afternoon", "good evening", "good night",
+        "how are you", "how are you doing", "hows it going", "how is it going",
+        "thanks", "thank you", "thx", "thank you very much", "thanks a lot", "many thanks", "cheers",
+        "bye", "goodbye", "see you", "cya", "bye bye", "farewell",
+        "help", "what can you do", "who are you", "what are you", "how can you help", "what do you do",
+        "can you help me", "what is your name", "who made you"
+    }
+
+    if q_norm in conversational_exact:
+        return INTENT_CONVERSATIONAL
+
+    # Conversational regex patterns
+    conversational_patterns = [
+        r"^(hi|hello|hey|heya|howdy|greetings)(\s+(there|bot|assistant|shm|team|friend|all))?$",
+        r"^(good\s+(morning|afternoon|evening|night))(\s+(there|bot|assistant|shm))?$",
+        r"^(thanks|thank\s+you|thx|cheers)(\s+(a\s+lot|so\s+much|very\s+much))?$",
+        r"^(bye|goodbye|cya|see\s+ya|bye\s+bye)$",
+        r"^(help|what\s+can\s+you\s+do|who\s+are\s+you|what\s+are\s+you|how\s+can\s+you\s+help|what\s+do\s+you\s+do)\??$",
+        r"^(how\s+are\s+you|how\s+are\s+you\s+doing|hows\s+it\s+going)\?$"
+    ]
+
+    for pat in conversational_patterns:
+        if re.match(pat, q_norm):
+            return INTENT_CONVERSATIONAL
+
+    # 3. GENERAL_ENGINEERING_INTENT — Educational / physics / engineering questions
+    engineering_patterns = [
+        r"what\s+is\s+(structural\s+health\s+monitoring|shm|a\s+load\s+cell|an?\s+aht20|mongodb|packet\s+loss|standard\s+deviation|force|temperature|humidity)",
+        r"what\s+does\s+(packet\s+loss|shm|telemetry)\s+mean",
+        r"explain\s+(standard\s+deviation|packet\s+loss|load\s+cell|shm|how\s+this\s+shm\s+system\s+works|how\s+it\s+works)",
+        r"how\s+does\s+(this\s+system|a\s+load\s+cell|shm|mongodb|packet\s+loss)\s+work"
+    ]
+
+    for pat in engineering_patterns:
+        if re.search(pat, q_lower):
+            return INTENT_GENERAL_ENGINEERING
+
+    # General question forms without telemetry data requests
+    if any(q_lower.startswith(prefix) for prefix in ["what is ", "what are ", "explain ", "how does ", "how do ", "why is ", "tell me about ", "define "]):
+        if not any(t in q_lower for t in ["current", "latest", "now", "today", "yesterday", "record", "records", "count", "gap", "gaps"]):
+            return INTENT_GENERAL_ENGINEERING
+
+    # Fallback to TELEMETRY_INTENT if sensor keywords exist
+    if any(s in q_lower for s in ["force", "temp", "humidity"]):
+        return INTENT_TELEMETRY
+
+    # Short 1-3 word conversational queries
+    if len(words) <= 3 and not any(w in q_lower for w in ["force", "temp", "humidity", "data", "log", "seq", "gaps", "min", "max", "avg"]):
+        if any(w in q_norm for w in ["hi", "hello", "hey", "help", "thanks", "bye", "ok", "okay"]):
+            return INTENT_CONVERSATIONAL
+
+    # Default fallback for unclassified questions
+    return INTENT_GENERAL_ENGINEERING
+
+def handle_conversational_intent(user_message: str) -> dict:
+    """
+    Handles simple conversational messages (greetings, thanks, farewells, capabilities, help).
+    Returns response with records_analyzed = 0 and DOES NOT query MongoDB.
+    """
+    q_norm = re.sub(r'[^\w\s]', '', user_message.strip().lower())
+
+    if any(g in q_norm for g in ["hi", "hello", "hey", "heya", "howdy", "greetings", "hola"]):
+        answer = (
+            "Hi! I'm the SHM Telemetry Assistant. I can help you with Force, Temperature, "
+            "and Humidity telemetry from the Arduino UNO-01 system. You can ask me for current readings, "
+            "statistics, historical data, record counts, active sensors, or packet-gap information. "
+            "What would you like to know?"
+        )
+    elif any(g in q_norm for g in ["good morning", "good afternoon", "good evening", "good night"]):
+        time_greeting = "Good day!"
+        if "morning" in q_norm:
+            time_greeting = "Good morning!"
+        elif "afternoon" in q_norm:
+            time_greeting = "Good afternoon!"
+        elif "evening" in q_norm:
+            time_greeting = "Good evening!"
+        answer = (
+            f"{time_greeting} I'm your SHM Telemetry Assistant. Ready to help you inspect Force, "
+            "Temperature, and Humidity telemetry from MongoDB Atlas. How can I assist you?"
+        )
+    elif any(t in q_norm for t in ["thanks", "thank you", "thx", "cheers"]):
+        answer = "You're welcome! Let me know if you need any telemetry information."
+    elif any(b in q_norm for b in ["bye", "goodbye", "cya", "see you", "farewell"]):
+        answer = "Goodbye! I'll be here whenever you need to check the SHM telemetry."
+    elif any(h in q_norm for h in ["how are you", "how are you doing", "hows it going"]):
+        answer = (
+            "I'm functioning normally and ready to assist you with bridge structural health monitoring "
+            "telemetry. What data or statistics would you like to check today?"
+        )
+    else:
+        answer = (
+            "I am the SHM Telemetry Assistant for the Arduino UNO-01 workstation. "
+            "Here are the telemetry capabilities I support:\n\n"
+            "• **Current Readings**: Request current Force, Temperature, or Humidity snapshot.\n"
+            "• **Telemetry Statistics**: Query max, min, mean, and standard deviation (today, yesterday, last 2 hours, etc.).\n"
+            "• **Historical Telemetry**: Inspect chronological telemetry history and export logs.\n"
+            "• **Record Count**: Check total telemetry documents stored in MongoDB Atlas.\n"
+            "• **Packet Gaps & Quality**: Analyze sequence continuity to detect dropped packets.\n"
+            "• **Active Sensors**: View active physical hardware nodes (FORCE-01, TEMP-01, HUMIDITY-01)."
+        )
+
+    return {
+        "status": "success",
+        "answer": answer,
+        "data_source": "SHM Assistant",
+        "analysis_details": {
+            "operation": "CONVERSATIONAL_RESPONSE",
+            "sensors": [],
+            "time_range": "N/A",
+            "records_analyzed": 0,
+            "execution_method": "Conversational Intent Handler"
+        }
+    }
+
+def handle_general_engineering_intent(user_message: str, chat_history: list) -> dict:
+    """
+    Handles general engineering, physics, or software questions that do NOT request telemetry data.
+    If an AI Provider is configured (OpenAI/Gemini), it generates a natural answer without querying MongoDB.
+    If no AI Provider is configured, it returns a clear deterministic fallback response.
+    """
+    provider_inst, provider_name, model_name = get_ai_provider()
+
+    # Check if operating under fallback mode (no AI API keys)
+    if isinstance(provider_inst, DeterministicMongoDBEngine):
+        answer = (
+            "Your SHM assistant is currently operating in telemetry-only fallback mode. "
+            "I can query the live MongoDB telemetry and explain the available telemetry functions, "
+            "but a general AI provider is not configured for broader engineering questions."
+        )
+        return {
+            "status": "success",
+            "answer": answer,
+            "data_source": "SHM Assistant",
+            "analysis_details": {
+                "operation": "GENERAL_ENGINEERING_FALLBACK",
+                "sensors": [],
+                "time_range": "N/A",
+                "records_analyzed": 0,
+                "execution_method": "Deterministic Fallback Engine (No AI Provider)"
+            }
+        }
+
+    # Call AI Provider without MongoDB telemetry tools / context
+    try:
+        if isinstance(provider_inst, (OpenAIProvider, GeminiProvider)):
+            answer, _ = provider_inst.generate_response(
+                user_query=user_message,
+                chat_history=chat_history,
+                is_telemetry_intent=False
+            )
+        else:
+            answer, _ = provider_inst.generate_response(
+                user_query=user_message,
+                chat_history=chat_history
+            )
+
+        return {
+            "status": "success",
+            "answer": answer,
+            "data_source": "SHM Assistant / General Knowledge",
+            "analysis_details": {
+                "operation": "GENERAL_ENGINEERING_RESPONSE",
+                "sensors": [],
+                "time_range": "N/A",
+                "records_analyzed": 0,
+                "execution_method": f"{provider_name} ({model_name})"
+            }
+        }
+    except Exception as e:
+        print(f"[CHATBOT ERROR] General engineering AI error: {e}")
+        answer = (
+            "Your SHM assistant is currently operating in telemetry-only fallback mode. "
+            "I can query the live MongoDB telemetry and explain the available telemetry functions, "
+            "but a general AI provider is not configured for broader engineering questions."
+        )
+        return {
+            "status": "success",
+            "answer": answer,
+            "data_source": "SHM Assistant",
+            "analysis_details": {
+                "operation": "GENERAL_ENGINEERING_FALLBACK",
+                "sensors": [],
+                "time_range": "N/A",
+                "records_analyzed": 0,
+                "execution_method": "Deterministic Fallback Engine (Provider Error)"
+            }
+        }
+
+# ------------------------------------------------------------------------------
 # PROVIDER-INDEPENDENT AI SERVICE ARCHITECTURE
 # ------------------------------------------------------------------------------
 class BaseAIProvider:
     """Abstract base class for AI Providers (OpenAI, Gemini, Fallback Engine)."""
-    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None) -> tuple:
+    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None, is_telemetry_intent: bool = True) -> tuple:
         """
         Returns: (answer_text: str, executed_tools_meta: list)
         """
@@ -460,17 +723,19 @@ class OpenAIProvider(BaseAIProvider):
         payload = {
             "model": self.model,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
             "temperature": 0.1,
             "max_tokens": 600
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         if resp.status_code == 200:
             return resp.json()
         raise RuntimeError(f"Chat Completions API error (HTTP {resp.status_code}): {resp.text[:300]}")
 
-    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None) -> tuple:
+    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None, is_telemetry_intent: bool = True) -> tuple:
         # Build Chat Completions messages list
         messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
 
@@ -481,6 +746,13 @@ class OpenAIProvider(BaseAIProvider):
                 messages.append({"role": "assistant", "content": h["bot"]})
 
         messages.append({"role": "user", "content": user_query})
+
+        if not is_telemetry_intent:
+            # General engineering query — do NOT attach tools
+            res_json = self._call_chat_completions(messages, tools=[])
+            choice = res_json["choices"][0]
+            content = choice["message"].get("content") or ""
+            return content.strip(), []
 
         executed_tools_meta = []
         max_turns = 5
@@ -531,15 +803,20 @@ class GeminiProvider(BaseAIProvider):
         self.api_key = api_key
         self.model = model or "gemini-2.5-flash"
 
-    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None) -> tuple:
+    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None, is_telemetry_intent: bool = True) -> tuple:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
         headers = {"Content-Type": "application/json"}
 
-        # Perform grounded MongoDB telemetry tool lookup for Gemini context
-        latest_res = mongodb_tool_get_latest()
-        context_str = json.dumps(latest_res, indent=2, default=str)
-
-        prompt_text = f"{SYSTEM_INSTRUCTION}\n\nAUTHORITATIVE MONGODB ATLAS TELEMETRY:\n{context_str}\n\nUser Question: {user_query}"
+        if is_telemetry_intent:
+            # Grounded MongoDB telemetry tool lookup ONLY for telemetry queries
+            latest_res = mongodb_tool_get_latest()
+            context_str = json.dumps(latest_res, indent=2, default=str)
+            prompt_text = f"{SYSTEM_INSTRUCTION}\n\nAUTHORITATIVE MONGODB ATLAS TELEMETRY:\n{context_str}\n\nUser Question: {user_query}"
+            tools_meta = [{"tool": "get_latest_sensor_data", "records_analyzed": 1}]
+        else:
+            # General non-telemetry query — DO NOT RETRIEVE MONGODB TELEMETRY
+            prompt_text = f"{SYSTEM_INSTRUCTION}\n\nUser Question: {user_query}"
+            tools_meta = []
 
         payload = {
             "contents": [{"parts": [{"text": prompt_text}]}],
@@ -553,7 +830,7 @@ class GeminiProvider(BaseAIProvider):
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
                 if parts:
-                    return parts[0].get("text", "").strip(), [{"tool": "get_latest_sensor_data", "records_analyzed": 1}]
+                    return parts[0].get("text", "").strip(), tools_meta
             raise RuntimeError("Gemini returned empty candidate response")
         else:
             raise RuntimeError(f"Gemini API error (HTTP {resp.status_code}): {resp.text[:300]}")
@@ -563,15 +840,16 @@ class DeterministicMongoDBEngine(BaseAIProvider):
     Emergency rule-based grounded telemetry formatter. Used ONLY when no external AI API key
     is configured or if AI provider connection fails. Clearly flags execution mode as fallback.
     """
-    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None) -> tuple:
+    def generate_response(self, user_query: str, chat_history: list, default_from_iso: str = None, default_to_iso: str = None, is_telemetry_intent: bool = True) -> tuple:
         q_lower = user_query.lower()
         sensor_filter = resolve_sensor_alias(user_query)
 
         is_active_query = any(k in q_lower for k in ["active sensor", "active sensors", "what sensors", "available sensor"])
-        is_gap_query = any(k in q_lower for k in ["gap", "missing", "packet loss", "dropped"])
+        is_gap_query = any(k in q_lower for k in ["gap", "missing", "packet loss", "dropped", "sequence gap"])
         is_count_query = any(k in q_lower for k in ["count", "how many", "stored", "total record", "number of record"])
-        is_stat_query = any(k in q_lower for k in ["max", "maximum", "min", "minimum", "avg", "average", "mean", "std", "stddev", "statistic"])
+        is_stat_query = any(k in q_lower for k in ["max", "maximum", "min", "minimum", "avg", "average", "mean", "std", "stddev", "statistic", "statistics"])
         is_history_query = any(k in q_lower for k in ["history", "historical", "readings", "list", "show", "export"]) or default_from_iso is not None
+        is_latest_query = any(k in q_lower for k in ["current", "latest", "now", "realtime", "real-time", "present", "snapshot", "force", "temperature", "temp", "humidity", "reading", "readings"])
 
         if is_active_query:
             tool_name = "get_active_sensors"
@@ -588,9 +866,17 @@ class DeterministicMongoDBEngine(BaseAIProvider):
         elif is_history_query:
             tool_name = "get_sensor_history"
             res = mongodb_tool_get_history(sensor_filter, default_from_iso, default_to_iso)
-        else:
+        elif is_latest_query:
             tool_name = "get_latest_sensor_data"
             res = mongodb_tool_get_latest(sensor_filter if sensor_filter != "ALL" else None)
+        else:
+            # General / unknown non-telemetry fallback — DO NOT QUERY MONGODB
+            ans = (
+                "Your SHM assistant is currently operating in telemetry-only fallback mode. "
+                "I can query live MongoDB telemetry (current readings, statistics, history, packet gaps, "
+                "record counts, active sensors), but a general AI provider is not configured for broader questions."
+            )
+            return ans, []
 
         meta = [{"tool": tool_name, "records_analyzed": res.get("total_checked") or res.get("total_documents") or 1}]
 
@@ -680,7 +966,15 @@ def get_ai_provider() -> tuple:
 def handle_chat_query(payload: dict) -> dict:
     """
     Main entry point for POST /api/v1/chat/query.
-    Processes natural language question, executes safe MongoDB tools, grounds answer in MongoDB data.
+    Enforces mandatory execution ordering:
+    1. Validate input message.
+    2. Classify explicit intent (CONVERSATIONAL_INTENT, TELEMETRY_INTENT, GENERAL_ENGINEERING_INTENT).
+    3. If CONVERSATIONAL_INTENT -> answer directly, 0 MongoDB queries, return immediately.
+    4. Handle fictional sensor warnings.
+    5. Handle GENERAL_ENGINEERING_INTENT (AI provider answer without tools or fallback response).
+    6. Only then parse telemetry time bounds.
+    7. Only then resolve telemetry sensor aliases.
+    8. Only then execute MongoDB read-only tools for TELEMETRY_INTENT.
     """
     if not isinstance(payload, dict):
         payload = {}
@@ -696,9 +990,15 @@ def handle_chat_query(payload: dict) -> dict:
             "analysis_details": {"operation": "INVALID_INPUT", "execution_method": "Input Sanitizer"}
         }
 
-    print(f"[CHATBOT] User Query: '{user_message}'")
+    # 1. Classify intent BEFORE any time parsing or database querying
+    intent = classify_intent(user_message)
+    print(f"[CHATBOT] User Query: '{user_message}' | Classified Intent: {intent}")
 
-    # Check for fictional sensor questions
+    # 2. CONVERSATIONAL_INTENT — Return immediately, ZERO MongoDB tool calls
+    if intent == INTENT_CONVERSATIONAL:
+        return handle_conversational_intent(user_message)
+
+    # 3. Check for fictional sensor questions
     q_upper = user_message.upper()
     if any(fake in q_upper for fake in FICTIONAL_SENSORS):
         ans = (
@@ -721,23 +1021,30 @@ def handle_chat_query(payload: dict) -> dict:
             }
         }
 
-    # Extract natural time bounds and sensor filter
+    # 4. GENERAL_ENGINEERING_INTENT
+    if intent == INTENT_GENERAL_ENGINEERING:
+        return handle_general_engineering_intent(user_message, chat_history)
+
+    # 5. TELEMETRY_INTENT — Parse time bounds, resolve aliases, execute MongoDB telemetry tools
     from_iso, to_iso, time_label = parse_natural_time_range(user_message)
     sensor_filter = resolve_sensor_alias(user_message)
 
-    # Obtain AI Provider or Fallback Engine
     provider_inst, provider_name, model_name = get_ai_provider()
-    print(f"[CHATBOT] Selected AI Provider: {provider_name} ({model_name})")
+    print(f"[CHATBOT] Selected AI Provider for Telemetry: {provider_name} ({model_name})")
 
     try:
-        answer, tools_meta = provider_inst.generate_response(user_message, chat_history, from_iso, to_iso)
-        op_name = tools_meta[0]["tool"] if tools_meta else "general_assistant_query"
+        answer, tools_meta = provider_inst.generate_response(
+            user_message, chat_history, from_iso, to_iso, is_telemetry_intent=True
+        )
+        op_name = tools_meta[0]["tool"] if tools_meta else "telemetry_query"
         records_cnt = sum(t.get("records_analyzed", 0) for t in tools_meta) if tools_meta else 0
         exec_method = f"{provider_name} ({model_name})"
     except Exception as e:
         print(f"[CHATBOT ERROR] AI Provider '{provider_name}' error: {e}. Falling back to Deterministic MongoDB Engine.")
         fallback = DeterministicMongoDBEngine()
-        answer, tools_meta = fallback.generate_response(user_message, chat_history, from_iso, to_iso)
+        answer, tools_meta = fallback.generate_response(
+            user_message, chat_history, from_iso, to_iso, is_telemetry_intent=True
+        )
         op_name = tools_meta[0]["tool"] if tools_meta else "mongodb_fallback_query"
         records_cnt = sum(t.get("records_analyzed", 0) for t in tools_meta) if tools_meta else 0
         exec_method = "AI Provider Unavailable / Fallback Mode (DeterministicMongoDBEngine)"
@@ -757,5 +1064,16 @@ def handle_chat_query(payload: dict) -> dict:
 
 if __name__ == "__main__":
     print("Testing chat_service.py...")
-    test_res = handle_chat_query({"message": "What is the current force?"})
-    print("Test Response:", json.dumps(test_res, indent=2))
+    for test_msg in [
+        "Hi", "Hello", "Hey", "Good morning", "How are you?", "Thanks", "Bye", "What can you do?", "Help",
+        "What is structural health monitoring?", "What is a load cell?",
+        "What is the current force?", "What is the current temperature?", "What is the current humidity?",
+        "What is the maximum force today?", "How many records are stored?", "Are there any packet gaps?",
+        "What sensors are active?", "Show the last 2 hours of temperature data"
+    ]:
+        test_res = handle_chat_query({"message": test_msg})
+        ans = test_res.get("answer", "")[:80].replace("\n", " ")
+        rec = test_res.get("analysis_details", {}).get("records_analyzed")
+        op = test_res.get("analysis_details", {}).get("operation")
+        print(f"Query: '{test_msg}' -> Op: {op}, Records: {rec}, Ans: '{ans}...'")
+

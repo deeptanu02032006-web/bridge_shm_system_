@@ -457,6 +457,19 @@ class QueryAPIRequestHandler(BaseHTTPRequestHandler):
         raw_params = parse_qs(parsed.query)
         params = {k: v[0] for k, v in raw_params.items() if v}
 
+        if path in ("/", "/index.html"):
+            index_file = os.path.join(BASE_DIR, "index.html")
+            if os.path.exists(index_file):
+                with open(index_file, "rb") as f:
+                    body = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
         if path == "/health":
             self._respond_json({"status": "healthy", "service": "SHM MongoDB Query API"})
             return

@@ -974,7 +974,6 @@ def run_bridge():
     print(f"                   : MongoDB Atlas -> 2-Min Sync -> Google Sheets (Secondary)")
     print(f"Sync Interval      : Every {SYNC_INTERVAL_SEC}s (Rolling {ROLLING_WINDOW_MINUTES}-Min Window)")
     print("==================================================================")
-
     if MONGODB_URI:
         mongo_manager.connect()
     else:
